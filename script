@@ -1,0 +1,168 @@
+import streamlit as st
+import pandas as pd
+import boto3
+import time
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+
+# ==========================================
+# 🔑 CREDENTIALS (WITH SESSION TOKEN)
+# ==========================================
+# Paste your temporary credentials here:
+AWS_ACCESS_KEY = "PASTE_YOUR_ACCESS_KEY_HERE"
+AWS_SECRET_KEY = "PASTE_YOUR_SECRET_KEY_HERE"
+AWS_SESSION_TOKEN = "PASTE_YOUR_SESSION_TOKEN_HERE" # <--- NEW: Required for temp credentials!
+REGION = "us-west-1"
+
+# --- CONFIGURATION ---
+ATHENA_DB = "vpc_logs_namespace"  
+ATHENA_TABLE = "vpc_flow_logs_table_063114128614" 
+ATHENA_OUTPUT_BUCKET = "s3://vpc-logs-iceberg-warehouse/athena-results/"
+
+# --- AWS CONNECTION (BYPASS EC2 ROLE) ---
+# We create a custom session using ALL THREE keys
+session = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    aws_session_token=AWS_SESSION_TOKEN, # <--- Added this line
+    region_name=REGION
+)
+# We force the client to use this specific session
+client = session.client('athena')
+
+def run_athena_query(base_query, filters=""):
+    # Inject filters
+    final_query = base_query.replace("WHERE 1=1", f"WHERE 1=1 {filters}")
+    
+    try:
+        response = client.start_query_execution(
+            QueryString=final_query,
+            QueryExecutionContext={'Database': ATHENA_DB},
+            ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_BUCKET}
+        )
+        query_execution_id = response['QueryExecutionId']
+        
+        with st.spinner('Querying Data...'):
+            while True:
+                stats = client.get_query_execution(QueryExecutionId=query_execution_id)
+                status = stats['QueryExecution']['Status']['State']
+                if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                    break
+                time.sleep(0.5)
+        
+        if status == 'FAILED':
+            st.error(f"Query Failed: {stats['QueryExecution']['Status']['StateChangeReason']}")
+            return pd.DataFrame()
+
+        results_location = stats['QueryExecution']['ResultConfiguration']['OutputLocation']
+        return pd.read_csv(results_location)
+    except Exception as e:
+        st.error(f"Connection Error: {e}")
+        return pd.DataFrame()
+
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="VPC Analytics (Token Auth)", layout="wide")
+st.title("🛡️ VPC Analytics Dashboard")
+
+# ==========================================
+# 🎛️ SIDEBAR FILTERS
+# ==========================================
+st.sidebar.header("🔍 Filters")
+
+# Date Filter (Partition Optimized)
+today = datetime.now().date()
+date_options = [today - timedelta(days=x) for x in range(7)]
+selected_date = st.sidebar.selectbox("📅 Select Date", date_options)
+formatted_date = selected_date.strftime('%Y-%m-%d')
+
+# Action Filter
+action_filter = st.sidebar.radio("🚦 Action", ["All", "ACCEPT", "REJECT"], horizontal=True)
+
+# Service Filter
+service_filter = st.sidebar.text_input("☁️ AWS Service", placeholder="e.g. EC2, S3")
+
+# IP Filter
+target_ip = st.sidebar.text_input("🔎 IP Address", placeholder="e.g. 10.0.1.5")
+
+limit = st.sidebar.slider("Max Rows", 5, 100, 20)
+
+if st.sidebar.button("🔄 Update"):
+    st.rerun()
+
+# Build SQL Filter String
+filter_sql = f" AND date = '{formatted_date}'"
+if action_filter != "All":
+    filter_sql += f" AND action = '{action_filter}'"
+if service_filter:
+    filter_sql += f" AND (pkt_src_aws_service LIKE '%{service_filter}%' OR pkt_dst_aws_service LIKE '%{service_filter}%')"
+if target_ip:
+    filter_sql += f" AND (srcaddr = '{target_ip}' OR dstaddr = '{target_ip}')"
+
+# ==========================================
+# 📊 TABS
+# ==========================================
+tab1, tab2, tab3 = st.tabs(["📈 Overview", "🌊 Flows", "🛡️ Security"])
+
+# TAB 1: OVERVIEW
+with tab1:
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.subheader("Traffic Volume (GB)")
+        traffic_sql = f"""
+            SELECT date_trunc('hour', from_unixtime(start)) as time_window, 
+                   SUM(bytes) / 1024.0 / 1024.0 / 1024.0 as total_gb
+            FROM "{ATHENA_TABLE}"
+            WHERE 1=1 
+            GROUP BY 1 ORDER BY 1 DESC LIMIT 24;
+        """
+        df_traffic = run_athena_query(traffic_sql, filter_sql)
+        if not df_traffic.empty:
+            df_traffic['time_window'] = pd.to_datetime(df_traffic['time_window'])
+            st.area_chart(df_traffic.set_index('time_window'))
+        else:
+            st.info("No data.")
+
+    with col2:
+        st.subheader("Top Services")
+        serv_sql = f"""
+            SELECT pkt_dst_aws_service, COUNT(*) as count 
+            FROM "{ATHENA_TABLE}" WHERE 1=1 AND pkt_dst_aws_service IS NOT NULL 
+            GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+        """
+        df_serv = run_athena_query(serv_sql, filter_sql)
+        if not df_serv.empty:
+            st.dataframe(df_serv, use_container_width=True)
+
+# TAB 2: FLOWS
+with tab2:
+    st.subheader("Flow Map")
+    flow_sql = f"""
+        SELECT srcaddr, dstaddr, SUM(bytes)/1024.0/1024.0 as total_mb 
+        FROM "{ATHENA_TABLE}" WHERE 1=1 
+        GROUP BY 1, 2 ORDER BY 3 DESC LIMIT {limit};
+    """
+    df_flow = run_athena_query(flow_sql, filter_sql)
+    if not df_flow.empty:
+        all_nodes = list(pd.concat([df_flow['srcaddr'], df_flow['dstaddr']]).unique())
+        node_map = {ip: i for i, ip in enumerate(all_nodes)}
+        fig = go.Figure(data=[go.Sankey(
+            node=dict(pad=15, thickness=20, label=all_nodes, color="blue"),
+            link=dict(source=df_flow['srcaddr'].map(node_map), 
+                      target=df_flow['dstaddr'].map(node_map), 
+                      value=df_flow['total_mb'])
+        )])
+        st.plotly_chart(fig, use_container_width=True)
+
+# TAB 3: SECURITY
+with tab3:
+    st.subheader("Rejected Traffic")
+    sec_sql = f"""
+        SELECT srcaddr, dstport, pkt_dst_aws_service, count(*) as blocks 
+        FROM "{ATHENA_TABLE}" WHERE 1=1 AND action='REJECT' 
+        GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT {limit};
+    """
+    df_sec = run_athena_query(sec_sql, filter_sql)
+    if not df_sec.empty:
+        st.dataframe(df_sec, use_container_width=True)
+    else:
+        st.success("No threats detected.")
