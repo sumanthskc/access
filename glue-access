@@ -1,0 +1,68 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "AllowSourceRead",
+			"Effect": "Allow",
+			"Action": [
+				"s3:ListBucket",
+				"s3:GetObject",
+				"s3:GetBucketLocation"
+			],
+			"Resource": [
+				"arn:aws:s3:::sample-s3-table-store-raw",
+				"arn:aws:s3:::sample-s3-table-store-raw/*"
+			]
+		},
+		{
+			"Sid": "AllowS3TablePhysicalWrite",
+			"Effect": "Allow",
+			"Action": [
+				"s3:PutObject",
+				"s3:GetObject",
+				"s3:DeleteObject",
+				"s3:AbortMultipartUpload",
+				"s3:ListBucket",
+				"s3:GetBucketLocation"
+			],
+			"Resource": [
+				"arn:aws:s3tables:us-west-1:414329322210:bucket/my-analytics-table-bucket",
+				"arn:aws:s3tables:us-west-1:414329322210:bucket/my-analytics-table-bucket/*"
+			]
+		},
+		{
+			"Sid": "AllowS3TableMetadataManagement",
+			"Effect": "Allow",
+			"Action": [
+				"s3tables:*"
+			],
+			"Resource": [
+				"arn:aws:s3tables:us-west-1:414329322210:bucket/my-analytics-table-bucket",
+				"arn:aws:s3tables:us-west-1:414329322210:bucket/my-analytics-table-bucket/*"
+			]
+		},
+		{
+			"Sid": "AllowGlueAndKMS",
+			"Effect": "Allow",
+			"Action": [
+				"glue:*",
+				"cloudwatch:PutMetricData",
+				"logs:*",
+				"kms:GenerateDataKey",
+				"kms:Decrypt",
+				"ec2:Describe*"
+			],
+			"Resource": "*"
+		},
+		{
+			"Sid": "GlueScriptBucket",
+			"Effect": "Allow",
+			"Action": [
+				"s3:GetObject",
+				"s3:PutObject",
+				"s3:ListBucket"
+			],
+			"Resource": "arn:aws:s3:::aws-glue-*"
+		}
+	]
+}
