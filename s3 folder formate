@@ -1,0 +1,17 @@
+Here is the folder structure for the logs:
+
+1. VPC Flow Logs
+
+S3 URL:
+s3://va-security-enterprise-vpcflowlogs/AWSLogs/063114128614/vpcflowlogs/us-east-1/2026/02/11/
+
+General Format:
+s3://<bucket-name>/AWSLogs/<account-id>/vpcflowlogs/<region>/<year>/<month>/<day>/
+
+2. Route 53 Resolver DNS Logs
+
+S3 URL:
+s3://va-security-enterprise-route53resolver-dns-logging/AWSLogs/287345720585/vpcdnsquerylogs/vpc-00037230eaa53d5e1/2026/02/09/
+
+General Format:
+s3://<bucket-name>/AWSLogs/<account-id>/vpcdnsquerylogs/<vpc-id>/<year>/<month>/<day>/
