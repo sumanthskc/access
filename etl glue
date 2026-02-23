@@ -1,0 +1,128 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from awsglue.dynamicframe import DynamicFrame
+
+# Get Job Arguments
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'PROCESS_DATE'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+PROCESS_DATE = args['PROCESS_DATE'] # Expected format: 2026/02/15
+
+# =========================================================
+# 1. READ WITH GROUPING (The Performance Fix)
+# =========================================================
+# We use the recursive path to pick up all regions for that date
+input_path = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/"
+
+datasource = glueContext.create_dynamic_frame.from_options(
+    connection_type="s3",
+    connection_options={
+        "paths": [input_path],
+        "recurse": True,
+        "groupFiles": "inPartition",
+        "groupSize": "67108864", # Testing with 64MB groups for faster feedback
+        "useS3ListImplementation": True
+    },
+    format="csv",
+    format_options={
+        "withHeader": False, 
+        "separator": " "
+    }
+)
+
+# Convert to Spark DF
+df = datasource.toDF()
+
+# =========================================================
+# 2. VALIDATION: FILTER OUT HEADERS (Fixes the Null issues)
+# =========================================================
+# VPC Flow logs often start with a 'version' number (e.g., 2 or 5). 
+# If a row is a header, it starts with text and causes numeric casts to fail (Resulting in NULLs).
+df_clean = df.filter(F.col("_c0").rlike("^[0-9]+$"))
+
+# =========================================================
+# 3. SCHEMA MAPPING (V2 Standard Example)
+# =========================================================
+col_names = [
+    "version", "account_id_val", "interface_id", "srcaddr", "dstaddr", 
+    "srcport", "dstport", "protocol", "packets", "bytes", "start", "end", 
+    "action", "log_status"
+]
+
+for i, name in enumerate(col_names):
+    if f"_c{i}" in df_clean.columns:
+        df_clean = df_clean.withColumnRenamed(f"_c{i}", name)
+
+# =========================================================
+# 4. PATH EXTRACTION (For Hive Partitioning)
+# =========================================================
+# Extracts account, region, year, month, day from the S3 file metadata
+df_partitioned = df_clean.withColumn("s3_path", F.input_file_name()) \
+    .withColumn("region", F.split(F.col("s3_path"), "/").getItem(6)) \
+    .withColumn("year", F.split(F.col("s3_path"), "/").getItem(7)) \
+    .withColumn("month", F.split(F.col("s3_path"), "/").getItem(8)) \
+    .withColumn("day", F.split(F.col("s3_path"), "/").getItem(9))
+
+# =========================================================
+# 5. DATA TYPE CONVERSION & NULL REPLACEMENT
+# =========================================================
+numeric_cols = ["srcport", "dstport", "protocol", "packets", "bytes", "start", "end"]
+
+for c in numeric_cols:
+    # Convert "-" (AWS default for no data) to actual NULL, then cast to Long
+    df_partitioned = df_partitioned.withColumn(
+        c, F.when(F.col(c) == "-", None).otherwise(F.col(c)).cast("long")
+    )
+
+# =========================================================
+# 6. TEST WRITE (Small Sample)
+# =========================================================
+# For testing, we limit the output to ensure we aren't waiting for 40GB to finish.
+test_output_path = "s3://ist-network-intelligence-vpcflowlogs-curated/testing_area/"
+
+# Repartition to a small number for testing (e.g., 5 files total)
+df_test_final = df_partitioned.limit(10000).repartition(2)
+
+df_test_final.write.mode("overwrite").partitionBy("region", "year", "month", "day").parquet(test_output_path)
+
+print("Test Job Completed. Please check the 'testing_area' in S3.")
+job.commit()
+
+
+Key,Value,Reason
+--enable-metrics,true,Allows you to see CPU/Memory usage in CloudWatch.
+--enable-spark-ui,true,Critical for debugging why a job is slow.
+--use-s3-list-implementation,true,"Crucial: Speeds up the ""listing"" of those 999+ files."
+--conf,spark.sql.parquet.fs.optimized.committer.optimization-enabled=true,Speeds up the final write of Parquet files to S3.
+
+
+for the destination.
+
+Type: Spark
+
+Glue Version: Glue 4.0 (This is critical for Spark 3.3 support, which handles Parquet much better).
+
+Language: Python 3
+
+Worker Type: G.1X
+
+Why? VPC Flow Logs are text-heavy. G.1X provides 16GB of RAM and 4 vCPUs per worker, which is the "sweet spot" for decompressing 1,000+ Gzip files without crashing.
+
+Requested Number of Workers: 15
+
+Why? At 15 workers, you have 60 executors. With 40GB of data, this should complete the ETL in roughly 10–15 minutes.
+
+Job Timeout: 1 hour (Since you were taking an hour before, this is a safe guard, but it should finish much faster now).
+
+Max Retries: 0 or 1 (For ETL, you usually don't want to auto-retry if it fails due to data issues).
+
