@@ -16,7 +16,7 @@ spark = glueContext.spark_session
 
 # =========================================================
 # THE MAGIC SPEED FIX FOR 1000+ SMALL GZ FILES
-# This forces standard Spark to group tiny .gz files into 128MB chunks 
+# Forces standard Spark to group tiny .gz files into 128MB chunks 
 # before processing, preventing the 1-hour delay.
 # =========================================================
 spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
@@ -31,14 +31,14 @@ INPUT_PATH = (
     f"AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
 )
 
+# You can change this to your final curated path once testing is complete
 OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/testing_area/"
 
 # =========================================================
-# READ GZ FILES
+# READ GZ FILES (Bypasses the _c0 Glue error)
 # =========================================================
 raw_df = spark.read.text(INPUT_PATH)
 
-# Safety check so it doesn't fail silently if the date is wrong
 if raw_df.isEmpty():
     raise Exception(f"❌ ERROR: No files found for path: {INPUT_PATH}")
 
@@ -61,26 +61,26 @@ for idx, name in enumerate(flow_log_columns):
 
 df = df.drop("value", "parts")
 
-# =========================================================
-# THE FIX FOR NULL COLUMNS
-# VPC logs have a header row (e.g., "version account-id interface-id...").
-# If we try to cast the word "bytes" to a bigint, Spark turns it into NULL.
-# This filter keeps ONLY rows where 'version' is a number.
-# =========================================================
+# Drop the header row (fixes the Null issues)
 df = df.filter(col("version").rlike("^[0-9]+$"))
 
 # =========================================================
-# NORMALIZE "-" → NULL & CAST
+# NORMALIZE "-" → NULL & CAST TO MATCH ATHENA
 # =========================================================
 for c in flow_log_columns:
     df = df.withColumn(c, when(col(c) == "-", None).otherwise(col(c)))
 
-numeric_cols = [
-    "srcport", "dstport", "protocol", "packets", "bytes",
-    "start", "end", "tcp_flags", "traffic_path"
-]
+# 1. Rename time columns to match Athena exactly
+df = df.withColumnRenamed("start", "start_time").withColumnRenamed("end", "end_time")
 
-for c in numeric_cols:
+# 2. Cast to Integer (Athena INT)
+int_cols = ["version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"]
+for c in int_cols:
+    df = df.withColumn(c, col(c).cast("integer"))
+
+# 3. Cast to BigInt (Athena BIGINT)
+bigint_cols = ["packets", "bytes", "start_time", "end_time"]
+for c in bigint_cols:
     df = df.withColumn(c, col(c).cast("bigint"))
 
 # =========================================================
@@ -97,15 +97,18 @@ df = (
 )
 
 # =========================================================
-# TEST WRITE (Limiting to 10,000 rows for quick testing)
+# WRITE PARQUET
 # =========================================================
-df_test = df.limit(10000).repartition(2)
+# Note: We limit to 10000 for testing. 
+# For the full 40GB run, remove .limit(10000) and change .repartition(2) 
+# to .repartition(200, "region", "year", "month", "day")
+df_final = df.limit(10000).repartition(2)
 
 (
-    df_test.write
+    df_final.write
       .mode("overwrite")
       .partitionBy("region", "year", "month", "day")
       .parquet(OUTPUT_PATH)
 )
 
-print(f"✅ Test run completed successfully for {PROCESS_DATE}")
+print(f"✅ Run completed successfully for {PROCESS_DATE}")
