@@ -1,0 +1,53 @@
+CREATE EXTERNAL TABLE IF NOT EXISTS vpc_flow_logs_parquet (
+  version INT,
+  account_id STRING,
+  interface_id STRING,
+  srcaddr STRING,
+  dstaddr STRING,
+  srcport INT,
+  dstport INT,
+  protocol INT,
+  packets BIGINT,
+  bytes BIGINT,
+  start_time BIGINT,
+  end_time BIGINT,
+  action STRING,
+  log_status STRING,
+  vpc_id STRING,
+  subnet_id STRING,
+  instance_id STRING,
+  tcp_flags INT,
+  type STRING,
+  pkt_srcaddr STRING,
+  pkt_dstaddr STRING,
+  az_id STRING,
+  sublocation_type STRING,
+  sublocation_id STRING,
+  pkt_src_aws_service STRING,
+  pkt_dst_aws_service STRING,
+  flow_direction STRING,
+  traffic_path INT
+)
+PARTITIONED BY (
+  region STRING,
+  year STRING,
+  month STRING,
+  day STRING
+)
+STORED AS PARQUET
+LOCATION 's3://ist-network-intelligence-vpcflowlogs-curated/testing_area/'
+
+MSCK REPAIR TABLE vpc_flow_logs_parquet;
+
+SELECT * FROM vpc_flow_logs_parquet 
+LIMIT 10;
+
+SELECT count(*) as total_rows,
+       count(bytes) as non_null_bytes,
+       count(packets) as non_null_packets
+FROM vpc_flow_logs_parquet;
+
+SELECT "$path", count(*) as rows_per_file
+FROM vpc_flow_logs_parquet
+GROUP BY "$path";
+TBLPROPERTIES ("parquet.compress"="SNAPPY");
