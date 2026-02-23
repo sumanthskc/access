@@ -17,21 +17,22 @@ spark = glueContext.spark_session
 # =========================================================
 # PRODUCTION PERFORMANCE TUNING
 # =========================================================
+# 1. Group small files to prevent 1000+ tiny tasks
 spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
 spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
 spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
 
-# SAFE RERUNS: Ensures overwriting only affects the specific date processed
+# 2. Safe Reruns: Overwrite only the specific partition being processed
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-# =========================================================
-# PATHS (PRODUCTION)
-# =========================================================
-# CHANGED: Replaced the hardcoded account ID with a '*' wildcard 
-# so it automatically picks up multiple accounts.
-INPUT_PATH = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/*/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
+# 3. S3 Read/Write Speed Fixes (Crucial for 40GB+ of data)
+spark.conf.set("mapreduce.input.fileinputformat.list-status.num-threads", "100")
+spark.conf.set("spark.sql.parquet.fs.optimized.committer.optimization-enabled", "true")
 
-# Pointed to the final curated bucket
+# =========================================================
+# PATHS
+# =========================================================
+INPUT_PATH = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/*/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
 OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
 
 # =========================================================
@@ -80,7 +81,6 @@ for c in bigint_cols:
 # =========================================================
 # 5. EXTRACT PARTITIONS FROM PATH
 # =========================================================
-# CHANGED: Added account_id extraction from the S3 path string
 path = split(input_file_name(), "/")
 df = (
     df
@@ -92,15 +92,17 @@ df = (
 )
 
 # =========================================================
-# 6. WRITE PARQUET (PRODUCTION SIZING)
+# 6. WRITE PARQUET (ANTI-SKEW LOGIC)
 # =========================================================
-# CHANGED: Added account_id to the repartitioning and partitionBy logic
-df_final = df.repartition(200, "account_id", "region", "year", "month", "day")
+# By repartitioning with a flat number (400) instead of column names, 
+# Spark distributes the 200GB+ of raw data perfectly evenly across all workers.
+df_final = df.repartition(400)
 
 (
     df_final.write
       .mode("overwrite") 
       .partitionBy("account_id", "region", "year", "month", "day")
+      .option("maxRecordsPerFile", 2_000_000) # Prevents "Small File Syndrome" in S3
       .parquet(OUTPUT_PATH)
 )
 
