@@ -1,0 +1,41 @@
+CREATE EXTERNAL TABLE IF NOT EXISTS vpc_flow_logs_curated (
+  version INT,
+  log_account_id STRING,
+  interface_id STRING,
+  srcaddr STRING,
+  dstaddr STRING,
+  srcport INT,
+  dstport INT,
+  protocol INT,
+  packets BIGINT,
+  bytes BIGINT,
+  start_time BIGINT,
+  end_time BIGINT,
+  action STRING,
+  log_status STRING,
+  vpc_id STRING,
+  subnet_id STRING,
+  instance_id STRING,
+  tcp_flags INT,
+  type STRING,
+  pkt_srcaddr STRING,
+  pkt_dstaddr STRING,
+  log_region STRING,
+  az_id STRING,
+  sublocation_type STRING,
+  sublocation_id STRING,
+  pkt_src_aws_service STRING,
+  pkt_dst_aws_service STRING,
+  flow_direction STRING,
+  traffic_path INT
+)
+PARTITIONED BY (
+  account_id STRING,
+  region STRING,
+  year STRING,
+  month STRING,
+  day STRING
+)
+STORED AS PARQUET
+LOCATION 's3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/'
+TBLPROPERTIES ("parquet.compress"="SNAPPY");
