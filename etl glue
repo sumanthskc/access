@@ -15,32 +15,38 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 
 # =========================================================
-# THE MAGIC SPEED FIX FOR 1000+ SMALL GZ FILES
-# Forces standard Spark to group tiny .gz files into chunks 
-# before processing, preventing the 1-hour delay.
+# PRODUCTION PERFORMANCE TUNING
 # =========================================================
 spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
 spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
 spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
 
-INPUT_PATH = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
-OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/testing_area/"
+# SAFE RERUNS: Ensures overwriting only affects the specific date processed
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
 # =========================================================
-# 1. READ WITH DYNAMIC HEADERS (The Fix for Data Shifting)
-# This reads the first line of the .gz files to get the exact format.
+# PATHS (PRODUCTION)
+# =========================================================
+# CHANGED: Replaced the hardcoded account ID with a '*' wildcard 
+# so it automatically picks up multiple accounts.
+INPUT_PATH = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/*/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
+
+# Pointed to the final curated bucket
+OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
+
+# =========================================================
+# 1. READ WITH DYNAMIC HEADERS
 # =========================================================
 raw_df = spark.read.option("header", "true").option("sep", " ").csv(INPUT_PATH)
 
 if raw_df.isEmpty():
-    raise Exception(f"❌ ERROR: No files found for path: {INPUT_PATH}")
+    print(f"⚠️ WARNING: No files found for {PROCESS_DATE}. Exiting gracefully.")
+    sys.exit(0)
 
 df = raw_df
 
 # =========================================================
 # 2. CLEAN UP COLUMN NAMES
-# AWS headers use dashes (e.g., 'account-id'). Athena hates dashes.
-# This converts them to underscores (e.g., 'account_id').
 # =========================================================
 for c in df.columns:
     clean_name = c.replace("-", "_").lower()
@@ -52,7 +58,6 @@ for c in df.columns:
 for c in df.columns:
     df = df.withColumn(c, when(col(c) == "-", None).otherwise(col(c)))
 
-# Athena reserves 'start' and 'end', so we rename them safely
 if "start" in df.columns:
     df = df.withColumnRenamed("start", "start_time")
 if "end" in df.columns:
@@ -60,7 +65,6 @@ if "end" in df.columns:
 
 # =========================================================
 # 4. DYNAMIC CASTING TO MATCH ATHENA
-# Only cast if the column actually exists in your custom log
 # =========================================================
 int_cols = ["version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"]
 bigint_cols = ["packets", "bytes", "start_time", "end_time"]
@@ -76,26 +80,28 @@ for c in bigint_cols:
 # =========================================================
 # 5. EXTRACT PARTITIONS FROM PATH
 # =========================================================
+# CHANGED: Added account_id extraction from the S3 path string
 path = split(input_file_name(), "/")
 df = (
     df
-    .withColumn("region", path.getItem(6))
-    .withColumn("year",   path.getItem(7))
-    .withColumn("month",  path.getItem(8))
-    .withColumn("day",    path.getItem(9))
+    .withColumn("account_id", path.getItem(4))
+    .withColumn("region",     path.getItem(6))
+    .withColumn("year",       path.getItem(7))
+    .withColumn("month",      path.getItem(8))
+    .withColumn("day",        path.getItem(9))
 )
 
 # =========================================================
-# 6. WRITE PARQUET
+# 6. WRITE PARQUET (PRODUCTION SIZING)
 # =========================================================
-# Limiting to 10000 for a quick test run.
-df_final = df.limit(10000).repartition(2)
+# CHANGED: Added account_id to the repartitioning and partitionBy logic
+df_final = df.repartition(200, "account_id", "region", "year", "month", "day")
 
 (
     df_final.write
-      .mode("overwrite")
-      .partitionBy("region", "year", "month", "day")
+      .mode("overwrite") 
+      .partitionBy("account_id", "region", "year", "month", "day")
       .parquet(OUTPUT_PATH)
 )
 
-print(f"✅ Run completed successfully for {PROCESS_DATE}")
+print(f"✅ PRODUCTION Run completed successfully for {PROCESS_DATE}")
