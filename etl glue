@@ -16,92 +16,79 @@ spark = glueContext.spark_session
 
 # =========================================================
 # THE MAGIC SPEED FIX FOR 1000+ SMALL GZ FILES
-# Forces standard Spark to group tiny .gz files into 128MB chunks 
+# Forces standard Spark to group tiny .gz files into chunks 
 # before processing, preventing the 1-hour delay.
 # =========================================================
 spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
 spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
 spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
 
-# =========================================================
-# PATHS
-# =========================================================
-INPUT_PATH = (
-    "s3://ist-network-intelligence-vpcflowlogs/"
-    f"AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
-)
-
-# You can change this to your final curated path once testing is complete
+INPUT_PATH = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
 OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/testing_area/"
 
 # =========================================================
-# READ GZ FILES (Bypasses the _c0 Glue error)
+# 1. READ WITH DYNAMIC HEADERS (The Fix for Data Shifting)
+# This reads the first line of the .gz files to get the exact format.
 # =========================================================
-raw_df = spark.read.text(INPUT_PATH)
+raw_df = spark.read.option("header", "true").option("sep", " ").csv(INPUT_PATH)
 
 if raw_df.isEmpty():
     raise Exception(f"❌ ERROR: No files found for path: {INPUT_PATH}")
 
-# =========================================================
-# VPC FLOW LOG SCHEMA & PARSING
-# =========================================================
-flow_log_columns = [
-    "version", "log_account_id", "interface_id", "srcaddr", "dstaddr",
-    "srcport", "dstport", "protocol", "packets", "bytes", "start", "end",
-    "action", "log_status", "vpc_id", "subnet_id", "instance_id",
-    "tcp_flags", "type", "pkt_srcaddr", "pkt_dstaddr", "log_region",
-    "az_id", "sublocation_type", "sublocation_id", "pkt_src_aws_service",
-    "pkt_dst_aws_service", "flow_direction", "traffic_path"
-]
-
-df = raw_df.withColumn("parts", split(col("value"), " "))
-
-for idx, name in enumerate(flow_log_columns):
-    df = df.withColumn(name, col("parts").getItem(idx))
-
-df = df.drop("value", "parts")
-
-# Drop the header row (fixes the Null issues)
-df = df.filter(col("version").rlike("^[0-9]+$"))
+df = raw_df
 
 # =========================================================
-# NORMALIZE "-" → NULL & CAST TO MATCH ATHENA
+# 2. CLEAN UP COLUMN NAMES
+# AWS headers use dashes (e.g., 'account-id'). Athena hates dashes.
+# This converts them to underscores (e.g., 'account_id').
 # =========================================================
-for c in flow_log_columns:
+for c in df.columns:
+    clean_name = c.replace("-", "_").lower()
+    df = df.withColumnRenamed(c, clean_name)
+
+# =========================================================
+# 3. NORMALIZE "-" TO NULL & RENAME RESERVED WORDS
+# =========================================================
+for c in df.columns:
     df = df.withColumn(c, when(col(c) == "-", None).otherwise(col(c)))
 
-# 1. Rename time columns to match Athena exactly
-df = df.withColumnRenamed("start", "start_time").withColumnRenamed("end", "end_time")
-
-# 2. Cast to Integer (Athena INT)
-int_cols = ["version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"]
-for c in int_cols:
-    df = df.withColumn(c, col(c).cast("integer"))
-
-# 3. Cast to BigInt (Athena BIGINT)
-bigint_cols = ["packets", "bytes", "start_time", "end_time"]
-for c in bigint_cols:
-    df = df.withColumn(c, col(c).cast("bigint"))
+# Athena reserves 'start' and 'end', so we rename them safely
+if "start" in df.columns:
+    df = df.withColumnRenamed("start", "start_time")
+if "end" in df.columns:
+    df = df.withColumnRenamed("end", "end_time")
 
 # =========================================================
-# EXTRACT PARTITIONS FROM FILE PATH
+# 4. DYNAMIC CASTING TO MATCH ATHENA
+# Only cast if the column actually exists in your custom log
+# =========================================================
+int_cols = ["version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"]
+bigint_cols = ["packets", "bytes", "start_time", "end_time"]
+
+for c in int_cols:
+    if c in df.columns:
+        df = df.withColumn(c, col(c).cast("integer"))
+
+for c in bigint_cols:
+    if c in df.columns:
+        df = df.withColumn(c, col(c).cast("bigint"))
+
+# =========================================================
+# 5. EXTRACT PARTITIONS FROM PATH
 # =========================================================
 path = split(input_file_name(), "/")
 df = (
     df
-    .withColumn("account_id", path.getItem(4))
-    .withColumn("region",     path.getItem(6))
-    .withColumn("year",       path.getItem(7))
-    .withColumn("month",      path.getItem(8))
-    .withColumn("day",        path.getItem(9))
+    .withColumn("region", path.getItem(6))
+    .withColumn("year",   path.getItem(7))
+    .withColumn("month",  path.getItem(8))
+    .withColumn("day",    path.getItem(9))
 )
 
 # =========================================================
-# WRITE PARQUET
+# 6. WRITE PARQUET
 # =========================================================
-# Note: We limit to 10000 for testing. 
-# For the full 40GB run, remove .limit(10000) and change .repartition(2) 
-# to .repartition(200, "region", "year", "month", "day")
+# Limiting to 10000 for a quick test run.
 df_final = df.limit(10000).repartition(2)
 
 (
