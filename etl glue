@@ -1,128 +1,111 @@
 import sys
-from awsglue.transforms import *
+from awsglue.context import GlueContext
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from pyspark.sql import functions as F
-from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import split, col, input_file_name, when
 
-# Get Job Arguments
+# =========================================================
+# INIT
+# =========================================================
 args = getResolvedOptions(sys.argv, ['JOB_NAME', 'PROCESS_DATE'])
+PROCESS_DATE = args['PROCESS_DATE']
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
-
-PROCESS_DATE = args['PROCESS_DATE'] # Expected format: 2026/02/15
 
 # =========================================================
-# 1. READ WITH GROUPING (The Performance Fix)
+# THE MAGIC SPEED FIX FOR 1000+ SMALL GZ FILES
+# This forces standard Spark to group tiny .gz files into 128MB chunks 
+# before processing, preventing the 1-hour delay.
 # =========================================================
-# We use the recursive path to pick up all regions for that date
-input_path = f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/"
+spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
+spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
+spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
 
-datasource = glueContext.create_dynamic_frame.from_options(
-    connection_type="s3",
-    connection_options={
-        "paths": [input_path],
-        "recurse": True,
-        "groupFiles": "inPartition",
-        "groupSize": "67108864", # Testing with 64MB groups for faster feedback
-        "useS3ListImplementation": True
-    },
-    format="csv",
-    format_options={
-        "withHeader": False, 
-        "separator": " "
-    }
+# =========================================================
+# PATHS
+# =========================================================
+INPUT_PATH = (
+    "s3://ist-network-intelligence-vpcflowlogs/"
+    f"AWSLogs/898302938380/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
 )
 
-# Convert to Spark DF
-df = datasource.toDF()
+OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/testing_area/"
 
 # =========================================================
-# 2. VALIDATION: FILTER OUT HEADERS (Fixes the Null issues)
+# READ GZ FILES
 # =========================================================
-# VPC Flow logs often start with a 'version' number (e.g., 2 or 5). 
-# If a row is a header, it starts with text and causes numeric casts to fail (Resulting in NULLs).
-df_clean = df.filter(F.col("_c0").rlike("^[0-9]+$"))
+raw_df = spark.read.text(INPUT_PATH)
+
+# Safety check so it doesn't fail silently if the date is wrong
+if raw_df.isEmpty():
+    raise Exception(f"❌ ERROR: No files found for path: {INPUT_PATH}")
 
 # =========================================================
-# 3. SCHEMA MAPPING (V2 Standard Example)
+# VPC FLOW LOG SCHEMA & PARSING
 # =========================================================
-col_names = [
-    "version", "account_id_val", "interface_id", "srcaddr", "dstaddr", 
-    "srcport", "dstport", "protocol", "packets", "bytes", "start", "end", 
-    "action", "log_status"
+flow_log_columns = [
+    "version", "log_account_id", "interface_id", "srcaddr", "dstaddr",
+    "srcport", "dstport", "protocol", "packets", "bytes", "start", "end",
+    "action", "log_status", "vpc_id", "subnet_id", "instance_id",
+    "tcp_flags", "type", "pkt_srcaddr", "pkt_dstaddr", "log_region",
+    "az_id", "sublocation_type", "sublocation_id", "pkt_src_aws_service",
+    "pkt_dst_aws_service", "flow_direction", "traffic_path"
 ]
 
-for i, name in enumerate(col_names):
-    if f"_c{i}" in df_clean.columns:
-        df_clean = df_clean.withColumnRenamed(f"_c{i}", name)
+df = raw_df.withColumn("parts", split(col("value"), " "))
+
+for idx, name in enumerate(flow_log_columns):
+    df = df.withColumn(name, col("parts").getItem(idx))
+
+df = df.drop("value", "parts")
 
 # =========================================================
-# 4. PATH EXTRACTION (For Hive Partitioning)
+# THE FIX FOR NULL COLUMNS
+# VPC logs have a header row (e.g., "version account-id interface-id...").
+# If we try to cast the word "bytes" to a bigint, Spark turns it into NULL.
+# This filter keeps ONLY rows where 'version' is a number.
 # =========================================================
-# Extracts account, region, year, month, day from the S3 file metadata
-df_partitioned = df_clean.withColumn("s3_path", F.input_file_name()) \
-    .withColumn("region", F.split(F.col("s3_path"), "/").getItem(6)) \
-    .withColumn("year", F.split(F.col("s3_path"), "/").getItem(7)) \
-    .withColumn("month", F.split(F.col("s3_path"), "/").getItem(8)) \
-    .withColumn("day", F.split(F.col("s3_path"), "/").getItem(9))
+df = df.filter(col("version").rlike("^[0-9]+$"))
 
 # =========================================================
-# 5. DATA TYPE CONVERSION & NULL REPLACEMENT
+# NORMALIZE "-" → NULL & CAST
 # =========================================================
-numeric_cols = ["srcport", "dstport", "protocol", "packets", "bytes", "start", "end"]
+for c in flow_log_columns:
+    df = df.withColumn(c, when(col(c) == "-", None).otherwise(col(c)))
+
+numeric_cols = [
+    "srcport", "dstport", "protocol", "packets", "bytes",
+    "start", "end", "tcp_flags", "traffic_path"
+]
 
 for c in numeric_cols:
-    # Convert "-" (AWS default for no data) to actual NULL, then cast to Long
-    df_partitioned = df_partitioned.withColumn(
-        c, F.when(F.col(c) == "-", None).otherwise(F.col(c)).cast("long")
-    )
+    df = df.withColumn(c, col(c).cast("bigint"))
 
 # =========================================================
-# 6. TEST WRITE (Small Sample)
+# EXTRACT PARTITIONS FROM FILE PATH
 # =========================================================
-# For testing, we limit the output to ensure we aren't waiting for 40GB to finish.
-test_output_path = "s3://ist-network-intelligence-vpcflowlogs-curated/testing_area/"
+path = split(input_file_name(), "/")
+df = (
+    df
+    .withColumn("account_id", path.getItem(4))
+    .withColumn("region",     path.getItem(6))
+    .withColumn("year",       path.getItem(7))
+    .withColumn("month",      path.getItem(8))
+    .withColumn("day",        path.getItem(9))
+)
 
-# Repartition to a small number for testing (e.g., 5 files total)
-df_test_final = df_partitioned.limit(10000).repartition(2)
+# =========================================================
+# TEST WRITE (Limiting to 10,000 rows for quick testing)
+# =========================================================
+df_test = df.limit(10000).repartition(2)
 
-df_test_final.write.mode("overwrite").partitionBy("region", "year", "month", "day").parquet(test_output_path)
+(
+    df_test.write
+      .mode("overwrite")
+      .partitionBy("region", "year", "month", "day")
+      .parquet(OUTPUT_PATH)
+)
 
-print("Test Job Completed. Please check the 'testing_area' in S3.")
-job.commit()
-
-
-Key,Value,Reason
---enable-metrics,true,Allows you to see CPU/Memory usage in CloudWatch.
---enable-spark-ui,true,Critical for debugging why a job is slow.
---use-s3-list-implementation,true,"Crucial: Speeds up the ""listing"" of those 999+ files."
---conf,spark.sql.parquet.fs.optimized.committer.optimization-enabled=true,Speeds up the final write of Parquet files to S3.
-
-
-for the destination.
-
-Type: Spark
-
-Glue Version: Glue 4.0 (This is critical for Spark 3.3 support, which handles Parquet much better).
-
-Language: Python 3
-
-Worker Type: G.1X
-
-Why? VPC Flow Logs are text-heavy. G.1X provides 16GB of RAM and 4 vCPUs per worker, which is the "sweet spot" for decompressing 1,000+ Gzip files without crashing.
-
-Requested Number of Workers: 15
-
-Why? At 15 workers, you have 60 executors. With 40GB of data, this should complete the ETL in roughly 10–15 minutes.
-
-Job Timeout: 1 hour (Since you were taking an hour before, this is a safe guard, but it should finish much faster now).
-
-Max Retries: 0 or 1 (For ETL, you usually don't want to auto-retry if it fails due to data issues).
-
+print(f"✅ Test run completed successfully for {PROCESS_DATE}")
