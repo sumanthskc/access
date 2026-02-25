@@ -1,0 +1,89 @@
+import sys
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql.functions import split, input_file_name
+
+# =========================================================
+# INIT
+# =========================================================
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# =========================================================
+# PERFORMANCE TUNING
+# =========================================================
+spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
+spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
+spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("mapreduce.input.fileinputformat.list-status.num-threads", "100")
+spark.conf.set("spark.sql.parquet.fs.optimized.committer.optimization-enabled", "true")
+
+# =========================================================
+# TEST PATHS (ONLY PROCESSING FEB 15)
+# =========================================================
+BASE_BUCKET = "s3://ist-network-intelligence-r53query/AWSLogs"
+
+# SAFE TEST OUTPUT DIRECTORY
+OUTPUT_PATH = "s3://your-target-bucket-name/test-vpcdnsquerylogs-curated/"
+
+# Hardcoded to just ONE day for a fast, cheap test run
+test_paths = [f"{BASE_BUCKET}/*/vpcdnsquerylogs/*/2026/02/15/*.gz"]
+
+# =========================================================
+# 1. READ RAW JSON
+# =========================================================
+print("🚀 Starting JSON Read Test...")
+raw_df = spark.read.json(test_paths)
+
+if raw_df.isEmpty():
+    print("⚠️ WARNING: No files found for Feb 15. Check your S3 path.")
+    sys.exit(0)
+
+print("📊 RAW JSON SCHEMA:")
+raw_df.printSchema()
+
+# =========================================================
+# 2. EXTRACT HIVE PARTITIONS FROM PATH (Skipped log_type)
+# =========================================================
+# Path index:
+# 4: account_id (e.g., 287345720585)
+# 5: log_type (vpcdnsquerylogs) -> SKIPPED
+# 6: vpc_id (e.g., vpc-a8671dcf)
+# 7: year (2026)
+# 8: month (02)
+# 9: day (15)
+
+path = split(input_file_name(), "/")
+df = (
+    raw_df
+    .withColumn("account_id", path.getItem(4))
+    .withColumn("vpc_id",     path.getItem(6))
+    .withColumn("year",       path.getItem(7))
+    .withColumn("month",      path.getItem(8))
+    .withColumn("day",        path.getItem(9))
+)
+
+print("👀 PREVIEW OF TRANSFORMED DATA (Top 5 Rows):")
+df.select("query_name", "query_type", "account_id", "vpc_id", "day").show(5, truncate=False)
+
+# =========================================================
+# 3. WRITE TEST PARQUET
+# =========================================================
+print("💾 Writing to Test Parquet Destination...")
+
+# Repartitioning using the new, cleaner partition list
+df_final = df.repartition("account_id", "vpc_id", "year", "month", "day")
+
+(
+    df_final.write
+      .mode("overwrite") 
+      .partitionBy("account_id", "vpc_id", "year", "month", "day")
+      .parquet(OUTPUT_PATH)
+)
+
+print(f"✅ TEST RUN COMPLETED. Check {OUTPUT_PATH} in S3!")
