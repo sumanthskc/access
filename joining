@@ -1,0 +1,19 @@
+SELECT 
+    f.start_time,
+    f.srcaddr,
+    f.dstaddr,
+    f.dstport,
+    r.query_name,
+    r.answers[1].rdata as resolved_ip
+FROM 
+    vpc_flow_logs f
+JOIN 
+    route53_dns_logs r 
+    ON f.srcaddr = r.srcaddr 
+    AND f.vpc_id = r.vpc_id
+WHERE 
+    -- Convert Route53 string timestamp to unix epoch for comparison
+    to_unixtime(from_iso8601_timestamp(r.query_timestamp)) 
+    BETWEEN (f.start_time - 60) AND f.start_time
+    -- Optional: Only look for traffic going to the IP the DNS resolved to
+    AND f.dstaddr = r.answers[1].rdata
