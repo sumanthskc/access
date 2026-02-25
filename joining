@@ -1,19 +1,73 @@
+CREATE TABLE enriched_vpc_dns_logs
+WITH (
+    format = 'PARQUET', -- Parquet is highly recommended for cost and speed
+    external_location = 's3://your-target-bucket-name/enriched_logs/path/',
+    partitioned_by = ARRAY['year', 'month', 'day']
+) AS
+WITH flattened_dns AS (
+    -- Step 1: Flatten the DNS array and grab the relevant DNS columns
+    SELECT 
+        query_timestamp,
+        query_name,
+        query_type,
+        rcode,
+        srcaddr AS dns_srcaddr,
+        vpc_id AS dns_vpc_id,
+        ans.rdata AS resolved_ip,
+        ans.type AS record_type
+    FROM 
+        route53_dns_logs
+    CROSS JOIN UNNEST(answers) AS t(ans)
+    WHERE 
+        ans.type = 'A' 
+        -- Best practice: filter specific partitions to reduce scanning costs
+        AND year = '2023' AND month = '10' AND day = '25'
+)
+
+-- Step 2: Select almost all columns, handling duplicates
 SELECT 
+    -- VPC Flow Log Data (Core Network Identity)
+    f.log_account_id,
+    f.interface_id,
+    f.srcaddr AS flow_srcaddr,
+    f.dstaddr AS flow_dstaddr,
+    f.srcport AS flow_srcport,
+    f.dstport AS flow_dstport,
+    f.protocol,
+    f.packets,
+    f.bytes,
     f.start_time,
-    f.srcaddr,
-    f.dstaddr,
-    f.dstport,
-    r.query_name,
-    r.answers[1].rdata as resolved_ip
+    f.end_time,
+    f.action,
+    f.log_status,
+    f.vpc_id,
+    f.subnet_id,
+    f.instance_id,
+    f.tcp_flags,
+    f.flow_direction,
+    f.traffic_path,
+    f.region,
+    
+    -- Route 53 DNS Data (The Enriched Context)
+    d.query_timestamp,
+    d.query_name,
+    d.query_type,
+    d.rcode,
+    d.record_type,
+    d.resolved_ip,
+    
+    -- Partitioning Columns (Must be at the very end of the SELECT statement)
+    f.year,
+    f.month,
+    f.day
 FROM 
     vpc_flow_logs f
 JOIN 
-    route53_dns_logs r 
-    ON f.srcaddr = r.srcaddr 
-    AND f.vpc_id = r.vpc_id
+    flattened_dns d
+    ON f.srcaddr = d.dns_srcaddr 
+    AND f.vpc_id = d.dns_vpc_id
+    AND f.dstaddr = d.resolved_ip
 WHERE 
-    -- Convert Route53 string timestamp to unix epoch for comparison
-    to_unixtime(from_iso8601_timestamp(r.query_timestamp)) 
-    BETWEEN (f.start_time - 60) AND f.start_time
-    -- Optional: Only look for traffic going to the IP the DNS resolved to
-    AND f.dstaddr = r.answers[1].rdata
+    -- Time Window: Match DNS query occurring up to 60 seconds before flow
+    to_unixtime(from_iso8601_timestamp(d.query_timestamp)) BETWEEN (f.start_time - 60) AND f.start_time
+    AND f.year = '2023' AND f.month = '10' AND f.day = '25';
