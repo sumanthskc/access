@@ -1,9 +1,11 @@
 SELECT 
-    account_id, 
-    region, 
-    srcaddr, 
-    dstport, 
-    bytes 
-FROM vpc_flow_logs_curated 
-WHERE year = '2026' AND month = '02' AND day = '23'
+    query_timestamp,
+    query_name,
+    query_type,
+    rcode,
+    srcaddr
+FROM 
+    your_database_name.test_route53_optimized_logs
+WHERE 
+    day = '15'
 LIMIT 10;
