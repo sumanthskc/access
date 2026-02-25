@@ -1,33 +1,9 @@
-CREATE EXTERNAL TABLE IF NOT EXISTS your_database_name.test_route53_optimized_logs (
-  `version` string,
-  `region` string,
-  `query_timestamp` string,
-  `query_name` string,
-  `query_type` string,
-  `query_class` string,
-  `rcode` string,
-  `answers` array<struct<rdata:string, type:string, class:string>>,
-  `srcaddr` string,
-  `srcport` int,
-  `transport` string,
-  `srcids` struct<instance:string, resolver_endpoint:string>
-)
-PARTITIONED BY (
-  `account_id` string,
-  `vpc_id` string,
-  `year` string,
-  `month` string,
-  `day` string
-)
-ROW FORMAT SERDE 
-  'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' 
-STORED AS INPUTFORMAT 
-  'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat' 
-OUTPUTFORMAT 
-  'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
-LOCATION
-  's3://your-target-bucket-name/test-vpcdnsquerylogs-curated/'
-TBLPROPERTIES (
-  'classification'='parquet',
-  'compressionType'='snappy'
-);
+SELECT 
+    account_id, 
+    region, 
+    srcaddr, 
+    dstport, 
+    bytes 
+FROM vpc_flow_logs_curated 
+WHERE year = '2026' AND month = '02' AND day = '23'
+LIMIT 10;
