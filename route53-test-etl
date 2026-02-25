@@ -1,11 +1,82 @@
-SELECT 
-    query_timestamp,
-    query_name,
-    query_type,
-    rcode,
-    srcaddr
-FROM 
-    your_database_name.test_route53_optimized_logs
-WHERE 
-    day = '15'
-LIMIT 10;
+import sys
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql.functions import split, input_file_name, col
+
+# =========================================================
+# INIT & TUNING
+# =========================================================
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
+spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
+spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+spark.conf.set("mapreduce.input.fileinputformat.list-status.num-threads", "100")
+spark.conf.set("spark.sql.parquet.fs.optimized.committer.optimization-enabled", "true")
+
+# =========================================================
+# PATHS
+# =========================================================
+BASE_BUCKET = "s3://ist-network-intelligence-r53query/AWSLogs"
+OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcdnsquerylogs-curated/"
+
+# Target Days 15 to 22
+target_days = [str(d) for d in range(15, 23)] 
+input_paths = [
+    f"{BASE_BUCKET}/*/vpcdnsquerylogs/*/2026/02/{day}/*.gz" 
+    for day in target_days
+]
+
+# =========================================================
+# 1. READ RAW JSON
+# =========================================================
+print(f"🚀 Starting Run for days: {target_days}")
+raw_df = spark.read.json(input_paths)
+
+if raw_df.isEmpty():
+    print("⚠️ WARNING: No files found. Exiting gracefully.")
+    sys.exit(0)
+
+# =========================================================
+# 2. SCHEMA CASTING (FIX FOR HIVE_BAD_DATA)
+# =========================================================
+# Force Spark to treat srcport as an integer so it matches Athena
+if "srcport" in raw_df.columns:
+    raw_df = raw_df.withColumn("srcport", col("srcport").cast("integer"))
+
+# =========================================================
+# 3. EXTRACT PARTITIONS (Skipping account_id to use native JSON value)
+# =========================================================
+path = split(input_file_name(), "/")
+
+# We dropped the path.getItem(4) line here.
+# Spark will now naturally use the 'account_id' it found inside the JSON.
+df = (
+    raw_df
+    .withColumn("vpc_id",     path.getItem(6))
+    .withColumn("year",       path.getItem(7))
+    .withColumn("month",      path.getItem(8))
+    .withColumn("day",        path.getItem(9))
+)
+
+# =========================================================
+# 4. WRITE PARQUET
+# =========================================================
+print("💾 Writing Parquet...")
+
+df_final = df.repartition("account_id", "vpc_id", "year", "month", "day")
+
+(
+    df_final.write
+      .mode("overwrite") 
+      .partitionBy("account_id", "vpc_id", "year", "month", "day")
+      .option("maxRecordsPerFile", 500000) # Prevents massive 400MB+ files
+      .parquet(OUTPUT_PATH)
+)
+
+print("✅ Processing completed successfully!")
