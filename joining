@@ -1,73 +1,43 @@
-CREATE TABLE enriched_vpc_dns_logs
+CREATE TABLE unified_network_analysis
 WITH (
-    format = 'PARQUET', -- Parquet is highly recommended for cost and speed
-    external_location = 's3://your-target-bucket-name/enriched_logs/path/',
-    partitioned_by = ARRAY['year', 'month', 'day']
+     format = 'PARQUET',
+     external_location = 's3://ist-network-intelligence-vpcflowlogs-curated/preaggregate/unified_layer/',
+     partitioned_by = ARRAY['year', 'month', 'day']
 ) AS
-WITH flattened_dns AS (
-    -- Step 1: Flatten the DNS array and grab the relevant DNS columns
+-- Step 1: Dedup DNS logs so 1 IP maps to 1 Domain per Client per Day
+WITH deduped_dns AS (
     SELECT 
-        query_timestamp,
-        query_name,
-        query_type,
-        rcode,
-        srcaddr AS dns_srcaddr,
-        vpc_id AS dns_vpc_id,
-        ans.rdata AS resolved_ip,
-        ans.type AS record_type
-    FROM 
-        route53_dns_logs
-    CROSS JOIN UNNEST(answers) AS t(ans)
-    WHERE 
-        ans.type = 'A' 
-        -- Best practice: filter specific partitions to reduce scanning costs
-        AND year = '2023' AND month = '10' AND day = '25'
+        account_id, vpc_id, client_ip, resolved_ip, year, month, day,
+        -- Get the most frequently queried domain for this IP today
+        MAX_BY(domain, query_count) as primary_domain 
+    FROM route53_dns_daily_summary
+    GROUP BY account_id, vpc_id, client_ip, resolved_ip, year, month, day
 )
-
--- Step 2: Select almost all columns, handling duplicates
 SELECT 
-    -- VPC Flow Log Data (Core Network Identity)
-    f.log_account_id,
-    f.interface_id,
-    f.srcaddr AS flow_srcaddr,
-    f.dstaddr AS flow_dstaddr,
-    f.srcport AS flow_srcport,
-    f.dstport AS flow_dstport,
-    f.protocol,
-    f.packets,
-    f.bytes,
-    f.start_time,
-    f.end_time,
-    f.action,
-    f.log_status,
-    f.vpc_id,
-    f.subnet_id,
-    f.instance_id,
-    f.tcp_flags,
-    f.flow_direction,
-    f.traffic_path,
-    f.region,
-    
-    -- Route 53 DNS Data (The Enriched Context)
-    d.query_timestamp,
-    d.query_name,
-    d.query_type,
-    d.rcode,
-    d.record_type,
-    d.resolved_ip,
-    
-    -- Partitioning Columns (Must be at the very end of the SELECT statement)
-    f.year,
-    f.month,
-    f.day
-FROM 
-    vpc_flow_logs f
-JOIN 
-    flattened_dns d
-    ON f.srcaddr = d.dns_srcaddr 
-    AND f.vpc_id = d.dns_vpc_id
-    AND f.dstaddr = d.resolved_ip
-WHERE 
-    -- Time Window: Match DNS query occurring up to 60 seconds before flow
-    to_unixtime(from_iso8601_timestamp(d.query_timestamp)) BETWEEN (f.start_time - 60) AND f.start_time
-    AND f.year = '2023' AND f.month = '10' AND f.day = '25';
+    v.account_id,
+    v.region,
+    v.vpc_id,
+    v.instance_id,
+    v.srcaddr AS client_ip,
+    v.dstaddr AS destination_ip,
+    r.primary_domain AS domain,
+    v.pkt_dst_aws_service,
+    v.traffic_path,
+    SUM(v.total_bytes) AS total_bytes,
+    SUM(v.total_packets) AS total_packets,
+    v.year,
+    v.month,
+    v.day
+FROM vpc_flow_daily_summary v
+LEFT JOIN deduped_dns r 
+    ON v.dstaddr = r.resolved_ip
+    AND v.srcaddr = r.client_ip
+    AND v.account_id = r.account_id
+    AND v.vpc_id = r.vpc_id -- Added VPC ID for safer multi-vpc environments
+    AND v.year = r.year 
+    AND v.month = r.month 
+    AND v.day = r.day
+GROUP BY 
+    v.account_id, v.region, v.vpc_id, v.instance_id, v.srcaddr, 
+    v.dstaddr, r.primary_domain, v.pkt_dst_aws_service, v.traffic_path,
+    v.year, v.month, v.day;
