@@ -1,0 +1,100 @@
+CREATE TABLE s3tablescatalog.networkautomation.destination_asn_service_agg
+WITH (
+    table_type = 'ICEBERG',
+    is_external = false,
+    partitioning = ARRAY['account_id','region','year','month','day']
+)
+AS
+-- 1. AGGREGATE FIRST: Group raw logs by destination IP to drastically reduce row count.
+WITH pre_aggregated_logs AS (
+    SELECT
+        account_id,
+        account_name,
+        region,
+        vpc_id,
+        year,
+        month,
+        day,
+        destination_ip,
+        pkt_dst_aws_service,
+        SUM(total_bytes) AS total_bytes
+    FROM joined_logs
+    WHERE instance_id IS NOT NULL
+    GROUP BY
+        account_id,
+        account_name,
+        region,
+        vpc_id,
+        year,
+        month,
+        day,
+        destination_ip,
+        pkt_dst_aws_service
+),
+
+-- 2. COMPUTE IP INT: Now we only run this math on unique IPs, not every single log line.
+logs_with_ip AS (
+    SELECT
+        *,
+        CAST(split_part(destination_ip,'.',1) AS bigint)*16777216 +
+        CAST(split_part(destination_ip,'.',2) AS bigint)*65536 +
+        CAST(split_part(destination_ip,'.',3) AS bigint)*256 +
+        CAST(split_part(destination_ip,'.',4) AS bigint) AS ip_int
+    FROM pre_aggregated_logs
+),
+
+-- 3. THE EXPENSIVE JOIN: Now applied to thousands of rows instead of millions.
+asn_resolved AS (
+    SELECT
+        l.account_id,
+        l.account_name,
+        l.region,
+        l.vpc_id,
+        l.year,
+        l.month,
+        l.day,
+
+        -- Determine ASN organization
+        CASE
+            WHEN l.pkt_dst_aws_service IS NOT NULL AND l.pkt_dst_aws_service != ''
+                THEN 'Amazon.com, Inc.'
+            ELSE COALESCE(a.autonomous_system_organization, 'Unknown ASN')
+        END AS asn_org,
+
+        -- Determine service label
+        COALESCE(NULLIF(l.pkt_dst_aws_service, ''), 'General Traffic') AS service_label,
+        l.total_bytes
+
+    FROM logs_with_ip l
+    -- OPTIMIZATION: Only attempt the heavy ASN range lookup if it's NOT an AWS service!
+    -- This skips the lookup entirely for internal/AWS traffic, speeding things up further.
+    LEFT JOIN geo_asn_blocks_range a
+        ON (l.pkt_dst_aws_service IS NULL OR l.pkt_dst_aws_service = '')
+       AND l.ip_int BETWEEN a.network_start_integer AND a.network_end_integer
+    
+    -- Note: Removed the unused join to aws_ip_ranges_int
+)
+
+-- 4. FINAL ROLLUP: Grouping the pre-aggregated chunks into their final ASN buckets.
+SELECT
+    account_id,
+    account_name,
+    region,
+    vpc_id,
+    year,
+    month,
+    day,
+    asn_org,
+    service_label,
+    SUM(total_bytes) AS total_bytes
+FROM asn_resolved
+GROUP BY
+    account_id,
+    account_name,
+    region,
+    vpc_id,
+    year,
+    month,
+    day,
+    asn_org,
+    service_label;
