@@ -67,12 +67,9 @@ asn_resolved AS (
 
     FROM logs_with_ip l
     -- OPTIMIZATION: Only attempt the heavy ASN range lookup if it's NOT an AWS service!
-    -- This skips the lookup entirely for internal/AWS traffic, speeding things up further.
     LEFT JOIN geo_asn_blocks_range a
         ON (l.pkt_dst_aws_service IS NULL OR l.pkt_dst_aws_service = '')
        AND l.ip_int BETWEEN a.network_start_integer AND a.network_end_integer
-    
-    -- Note: Removed the unused join to aws_ip_ranges_int
 )
 
 -- 4. FINAL ROLLUP: Grouping the pre-aggregated chunks into their final ASN buckets.
@@ -97,4 +94,4 @@ GROUP BY
     month,
     day,
     asn_org,
-    service_label;
+    service_label
