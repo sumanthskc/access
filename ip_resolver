@@ -1,0 +1,24 @@
+import pandas as pd
+import socket
+
+# Replace 'ips.csv' with your filename and 'ip_column' with the column name
+input_file = 'ips.csv'
+output_file = 'resolved_ips.csv'
+ip_column = 'ip_address' 
+
+def resolve_ip(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (socket.herror, socket.gaierror, Exception):
+        return "No domain found"
+
+# Read the CSV
+df = pd.read_csv(input_file)
+
+# Resolve each IP
+print("Resolving IPs, please wait...")
+df['domain_name'] = df[ip_column].apply(resolve_ip)
+
+# Save the results
+df.to_csv(output_file, index=False)
+print(f"Done! Results saved to {output_file}")
