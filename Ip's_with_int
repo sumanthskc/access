@@ -331,3 +331,85 @@ LEFT JOIN geo_country_blocks_range g
     ON m.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
 LEFT JOIN geo_country_locations loc
     ON g.geoname_id = loc.geoname_id;
+
+
+
+------------------------------------------------------------------------------------------------
+CREATE TABLE networkautomation.vpc_egress_domain_country_preagg
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://ist-network-intelligence-vpcflowlogs-curated/preaggregate/vpc_egress_domain_country_preagg/',
+    partitioned_by = ARRAY['account_id','region','year','month','day']
+)
+AS
+-- 1. CRUSH & EXTRACT: Get the exact IP integer AND the first octet
+WITH crushed_logs AS (
+    SELECT 
+        account_id,
+        region,
+        vpc_id,
+        destination_ip,
+        year,
+        month,
+        day,
+        SUM(total_bytes) AS total_bytes,
+        
+        -- Extract the First Octet for our high-speed Hash Join
+        CAST(split_part(destination_ip,'.',1) AS bigint) AS octet1,
+        
+        -- Compute the full integer for the precision check
+        (
+            CAST(split_part(destination_ip,'.',1) AS bigint) * 16777216 +
+            CAST(split_part(destination_ip,'.',2) AS bigint) * 65536 +
+            CAST(split_part(destination_ip,'.',3) AS bigint) * 256 +
+            CAST(split_part(destination_ip,'.',4) AS bigint)
+        ) AS ip_int
+    FROM vpc_egress_unique_dst_preagg
+    GROUP BY 
+        account_id,
+        region,
+        vpc_id,
+        destination_ip,
+        year,
+        month,
+        day
+),
+
+-- 2. GEO PREP: Mathematically extract the first octet from the Geo range table
+geo_prepared AS (
+    SELECT 
+        network_start_integer,
+        network_end_integer,
+        geoname_id,
+        -- Dividing the start integer by 256^3 gets us the exact first octet
+        CAST(network_start_integer / 16777216 AS bigint) AS octet1
+    FROM geo_country_blocks_range
+)
+
+-- 3. FINAL ASSEMBLY: The Blazing Fast Hash Join
+SELECT 
+    c.vpc_id,
+    c.destination_ip,
+    COALESCE(r.domain, 'unknown') AS domain,
+    loc.country_name,
+    c.total_bytes,
+    c.ip_int,
+
+    -- PARTITIONS MUST BE LAST
+    c.account_id,
+    c.region,
+    c.year,
+    c.month,
+    c.day
+
+FROM crushed_logs c
+LEFT JOIN resolved_ips r
+    ON c.destination_ip = r.dstaddr
+
+-- 🚨 THE MAGIC IS HERE 🚨
+LEFT JOIN geo_prepared g
+    ON c.octet1 = g.octet1  -- Forces Athena to instantly partition data (Hash Join)
+   AND c.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
+
+LEFT JOIN geo_country_locations loc
+    ON g.geoname_id = loc.geoname_id;
