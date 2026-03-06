@@ -261,3 +261,73 @@ SELECT
 FROM base_agg b
 LEFT JOIN ip_geo_dict geo 
     ON b.destination_ip = geo.destination_ip;
+
+
+CREATE TABLE networkautomation.vpc_egress_domain_country_preagg
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://ist-network-intelligence-vpcflowlogs-curated/preaggregate/vpc_egress_domain_country_preagg/',
+    partitioned_by = ARRAY['account_id','region','year','month','day']
+)
+AS
+-- 1. CRUSH FIRST: Read the massive source table exactly ONCE. 
+-- Group it down to the bare minimum rows before doing any joins or math.
+WITH crushed_logs AS (
+    SELECT 
+        account_id,
+        region,
+        vpc_id,
+        destination_ip,
+        year,
+        month,
+        day,
+        SUM(total_bytes) AS total_bytes
+    FROM vpc_egress_unique_dst_preagg
+    -- 💡 OPTIMIZATION TIP: If this still times out, you MUST add a WHERE clause here
+    -- to process one month at a time (e.g., WHERE year = '2026' AND month = '03')
+    GROUP BY 
+        account_id,
+        region,
+        vpc_id,
+        destination_ip,
+        year,
+        month,
+        day
+),
+
+-- 2. IP MATH: Only run the heavy string-splitting math on the highly compressed dataset.
+ip_math AS (
+    SELECT 
+        *,
+        (
+            CAST(split_part(destination_ip,'.',1) AS bigint) * 16777216 +
+            CAST(split_part(destination_ip,'.',2) AS bigint) * 65536 +
+            CAST(split_part(destination_ip,'.',3) AS bigint) * 256 +
+            CAST(split_part(destination_ip,'.',4) AS bigint)
+        ) AS ip_int
+    FROM crushed_logs
+)
+
+-- 3. FINAL JOINS: Now join the dictionaries to our tiny pre-aggregated base.
+SELECT 
+    m.vpc_id,
+    m.destination_ip,
+    COALESCE(r.domain, 'unknown') AS domain,
+    loc.country_name,
+    m.total_bytes,
+    m.ip_int,
+
+    -- PARTITIONS MUST BE LAST
+    m.account_id,
+    m.region,
+    m.year,
+    m.month,
+    m.day
+
+FROM ip_math m
+LEFT JOIN resolved_ips r
+    ON m.destination_ip = r.dstaddr
+LEFT JOIN geo_country_blocks_range g
+    ON m.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
+LEFT JOIN geo_country_locations loc
+    ON g.geoname_id = loc.geoname_id;
