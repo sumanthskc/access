@@ -179,3 +179,85 @@ WHERE account_id = '$account'
 GROUP BY asn_org
 ORDER BY SUM(total_bytes) DESC
 LIMIT 20
+
+
+------------------------------------------
+
+CREATE TABLE networkautomation.vpc_egress_domain_country_preagg
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://ist-network-intelligence-vpcflowlogs-curated/preaggregate/vpc_egress_domain_country_preagg/',
+    partitioned_by = ARRAY['account_id','region','year','month','day']
+)
+AS
+-- 1. EXTRACT UNIQUE IPs: Only do the heavy IP math once per unique address
+WITH unique_ips AS (
+    SELECT 
+        DISTINCT destination_ip,
+        (
+            CAST(split_part(destination_ip,'.',1) AS bigint) * 16777216 +
+            CAST(split_part(destination_ip,'.',2) AS bigint) * 65536 +
+            CAST(split_part(destination_ip,'.',3) AS bigint) * 256 +
+            CAST(split_part(destination_ip,'.',4) AS bigint)
+        ) AS ip_int
+    FROM vpc_egress_unique_dst_preagg
+),
+
+-- 2. THE EXPENSIVE JOIN: Map IP to Country (Runs thousands of times, not millions)
+ip_geo_dict AS (
+    SELECT 
+        u.destination_ip,
+        u.ip_int,
+        loc.country_name
+    FROM unique_ips u
+    LEFT JOIN geo_country_blocks_range g
+        ON u.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
+    LEFT JOIN geo_country_locations loc
+        ON g.geoname_id = loc.geoname_id
+),
+
+-- 3. BASE AGGREGATION: Group with domains (Preserves your original logic)
+base_agg AS (
+    SELECT
+        v.account_id,
+        v.region,
+        v.vpc_id,
+        v.destination_ip,
+        COALESCE(r.domain, 'unknown') AS domain,
+        v.year,
+        v.month,
+        v.day,
+        SUM(v.total_bytes) AS total_bytes
+    FROM vpc_egress_unique_dst_preagg v
+    LEFT JOIN resolved_ips r
+        ON v.destination_ip = r.dstaddr
+    GROUP BY
+        v.account_id,
+        v.region,
+        v.vpc_id,
+        v.destination_ip,
+        COALESCE(r.domain, 'unknown'),
+        v.year,
+        v.month,
+        v.day
+)
+
+-- 4. FINAL ASSEMBLY: Fast exact-string match to attach country data
+SELECT
+    b.vpc_id,
+    b.destination_ip,
+    b.domain,
+    geo.country_name,
+    b.total_bytes,
+    geo.ip_int,
+
+    -- PARTITIONS MUST BE LAST
+    b.account_id,
+    b.region,
+    b.year,
+    b.month,
+    b.day
+
+FROM base_agg b
+LEFT JOIN ip_geo_dict geo 
+    ON b.destination_ip = geo.destination_ip;
