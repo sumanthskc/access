@@ -122,3 +122,60 @@ GROUP BY
     l.year,
     l.month,
     l.day;
+
+
+
+SELECT
+    asn_org,
+    
+    -- AWS services: only meaningful for Amazon
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'S3' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS S3,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'EC2' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS EC2,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'AMAZON' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS AMAZON,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'ROUTE53' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS ROUTE53,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'CLOUDFRONT' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS CLOUDFRONT,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'DYNAMODB' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS DYNAMODB,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'GLOBALACCELERATOR' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS GLOBALACCELERATOR,
+
+    CASE WHEN asn_org = 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'AMAZON_CONNECT' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS AMAZON_CONNECT,
+
+    -- General Traffic: only for non-Amazon ASNs
+    CASE WHEN asn_org != 'Amazon.com, Inc.' THEN
+        ROUND(CAST(SUM(CASE WHEN service_label = 'General Traffic' THEN total_bytes ELSE 0 END) AS double) / (1024.0*1024.0*1024.0), 3)
+    ELSE NULL END AS General_Traffic
+
+FROM s3tablescatalog.networkautomation.destination_asn_service_agg
+
+-- These filters now map directly to your Iceberg partitions, making the query lightning fast
+WHERE account_id = '$account'
+  AND vpc_id IN (${vpc:singlequote})
+  AND region IN (${region:singlequote})
+  AND year IN (${year:singlequote})
+  AND month IN (${month:singlequote})
+  AND day IN (${day:singlequote})
+
+GROUP BY asn_org
+ORDER BY SUM(total_bytes) DESC
+LIMIT 20
