@@ -1,24 +1,41 @@
+pip install aiodns aiohttp pandas
+
+import asyncio
+import aiodns
 import pandas as pd
-import socket
 
-# Replace 'ips.csv' with your filename and 'ip_column' with the column name
-input_file = 'ips.csv'
-output_file = 'resolved_ips.csv'
-ip_column = 'ip_address' 
-
-def resolve_ip(ip):
+async def resolve_ip(resolver, ip):
     try:
-        return socket.gethostbyaddr(ip)[0]
-    except (socket.herror, socket.gaierror, Exception):
-        return "No domain found"
+        # Performs a reverse DNS lookup (PTR record)
+        result = await resolver.gethostbyaddr(ip)
+        return ip, result.name
+    except Exception:
+        return ip, "No domain found"
 
-# Read the CSV
-df = pd.read_csv(input_file)
+async def bulk_resolve(ip_list):
+    # Use Google's Public DNS for higher rate limits
+    resolver = aiodns.DNSResolver(nameservers=['8.8.8.8', '8.8.4.4'])
+    tasks = [resolve_ip(resolver, ip) for ip in ip_list]
+    
+    # Process in chunks of 1000 to avoid overwhelming the network stack
+    chunk_size = 1000
+    all_results = []
+    
+    for i in range(0, len(tasks), chunk_size):
+        chunk = tasks[i:i + chunk_size]
+        results = await asyncio.gather(*chunk)
+        all_results.extend(results)
+        print(f"Processed {len(all_results)} / {len(ip_list)}...")
+        
+    return dict(all_results)
 
-# Resolve each IP
-print("Resolving IPs, please wait...")
-df['domain_name'] = df[ip_column].apply(resolve_ip)
+# --- Main Execution ---
+df = pd.read_csv('your_file.csv')
+ip_list = df['ip_address'].tolist()
 
-# Save the results
-df.to_csv(output_file, index=False)
-print(f"Done! Results saved to {output_file}")
+loop = asyncio.get_event_loop()
+resolved_dict = loop.run_until_complete(bulk_resolve(ip_list))
+
+# Map results back to dataframe and save
+df['domain'] = df['ip_address'].map(resolved_dict)
+df.to_csv('resolved_200k.csv', index=False)
