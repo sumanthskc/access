@@ -72,3 +72,53 @@ GROUP BY
         ELSE COALESCE(dict.asn_org, 'Unknown ASN')
     END,
     COALESCE(NULLIF(l.pkt_dst_aws_service, ''), 'General Traffic');
+---------------------------------------------------------------------------
+CREATE TABLE s3tablescatalog.networkautomation.destination_asn_service_agg
+WITH (
+    table_type = 'ICEBERG',
+    is_external = false,
+    partitioning = ARRAY['account_id','region','year','month','day']
+)
+AS
+SELECT
+    l.account_name,
+    l.vpc_id,
+
+    -- Use the dictionary for external IPs, force Amazon for known AWS services
+    CASE
+        WHEN l.pkt_dst_aws_service IS NOT NULL AND l.pkt_dst_aws_service != ''
+            THEN 'Amazon.com, Inc.'
+        ELSE COALESCE(dict.asn_org, 'Unknown ASN')
+    END AS asn_org,
+
+    COALESCE(NULLIF(l.pkt_dst_aws_service, ''), 'General Traffic') AS service_label,
+    
+    SUM(l.total_bytes) AS total_bytes,
+
+    -- 🚨 PARTITION COLUMNS MUST BE AT THE VERY END IN THIS EXACT ORDER 🚨
+    l.account_id,
+    l.region,
+    l.year,
+    l.month,
+    l.day
+
+FROM networkautomation.joined_logs l
+-- Fast exact-string match against our new dictionary
+LEFT JOIN s3tablescatalog.networkautomation.ip_asn_dictionary dict
+    ON l.destination_ip = dict.destination_ip
+WHERE l.instance_id IS NOT NULL
+GROUP BY
+    l.account_name,
+    l.vpc_id,
+    CASE
+        WHEN l.pkt_dst_aws_service IS NOT NULL AND l.pkt_dst_aws_service != ''
+            THEN 'Amazon.com, Inc.'
+        ELSE COALESCE(dict.asn_org, 'Unknown ASN')
+    END,
+    COALESCE(NULLIF(l.pkt_dst_aws_service, ''), 'General Traffic'),
+    -- GROUP BY MUST ALSO MATCH THE SELECT ORDER
+    l.account_id,
+    l.region,
+    l.year,
+    l.month,
+    l.day;
