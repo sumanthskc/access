@@ -1,0 +1,74 @@
+CREATE TABLE s3tablescatalog.networkautomation.ip_asn_dictionary AS
+WITH unique_external_ips AS (
+    -- Extract only unique IPs that are NOT AWS internal traffic
+    SELECT DISTINCT destination_ip
+    FROM networkautomation.joined_logs
+    WHERE instance_id IS NOT NULL
+      AND (pkt_dst_aws_service IS NULL OR pkt_dst_aws_service = '')
+),
+ips_with_int AS (
+    -- Compute the integer only once per globally unique IP
+    SELECT 
+        destination_ip,
+        CAST(split_part(destination_ip,'.',1) AS bigint)*16777216 +
+        CAST(split_part(destination_ip,'.',2) AS bigint)*65536 +
+        CAST(split_part(destination_ip,'.',3) AS bigint)*256 +
+        CAST(split_part(destination_ip,'.',4) AS bigint) AS ip_int
+    FROM unique_external_ips
+)
+-- Perform the heavy BETWEEN join just once per IP
+SELECT 
+    l.destination_ip,
+    COALESCE(a.autonomous_system_organization, 'Unknown ASN') AS asn_org
+FROM ips_with_int l
+LEFT JOIN geo_asn_blocks_range a
+    ON l.ip_int BETWEEN a.network_start_integer AND a.network_end_integer;
+
+------------------------------------------------------------------------------------
+
+CREATE TABLE s3tablescatalog.networkautomation.destination_asn_service_agg
+WITH (
+    table_type = 'ICEBERG',
+    is_external = false,
+    partitioning = ARRAY['account_id','region','year','month','day']
+)
+AS
+SELECT
+    l.account_id,
+    l.account_name,
+    l.region,
+    l.vpc_id,
+    l.year,
+    l.month,
+    l.day,
+
+    -- Use the dictionary for external IPs, force Amazon for known AWS services
+    CASE
+        WHEN l.pkt_dst_aws_service IS NOT NULL AND l.pkt_dst_aws_service != ''
+            THEN 'Amazon.com, Inc.'
+        ELSE COALESCE(dict.asn_org, 'Unknown ASN')
+    END AS asn_org,
+
+    COALESCE(NULLIF(l.pkt_dst_aws_service, ''), 'General Traffic') AS service_label,
+    
+    SUM(l.total_bytes) AS total_bytes
+
+FROM networkautomation.joined_logs l
+-- Fast exact-string match against our new dictionary
+LEFT JOIN s3tablescatalog.networkautomation.ip_asn_dictionary dict
+    ON l.destination_ip = dict.destination_ip
+WHERE l.instance_id IS NOT NULL
+GROUP BY
+    l.account_id,
+    l.account_name,
+    l.region,
+    l.vpc_id,
+    l.year,
+    l.month,
+    l.day,
+    CASE
+        WHEN l.pkt_dst_aws_service IS NOT NULL AND l.pkt_dst_aws_service != ''
+            THEN 'Amazon.com, Inc.'
+        ELSE COALESCE(dict.asn_org, 'Unknown ASN')
+    END,
+    COALESCE(NULLIF(l.pkt_dst_aws_service, ''), 'General Traffic');
