@@ -1,8 +1,7 @@
-pip install aiodns aiohttp pandas
-
 import asyncio
 import aiodns
 import pandas as pd
+import sys
 
 async def resolve_ip(resolver, ip):
     try:
@@ -10,16 +9,21 @@ async def resolve_ip(resolver, ip):
         result = await resolver.gethostbyaddr(ip)
         return ip, result.name
     except Exception:
+        # If it fails, no domain exists or it timed out
         return ip, "No domain found"
 
 async def bulk_resolve(ip_list):
     # Use Google's Public DNS for higher rate limits
     resolver = aiodns.DNSResolver(nameservers=['8.8.8.8', '8.8.4.4'])
+    
+    # Create a task for each unique IP
     tasks = [resolve_ip(resolver, ip) for ip in ip_list]
     
-    # Process in chunks of 1000 to avoid overwhelming the network stack
+    # Process in chunks of 1000 to avoid overwhelming your network adapter
     chunk_size = 1000
     all_results = []
+    
+    print(f"Starting resolution for {len(ip_list)} unique IPs...")
     
     for i in range(0, len(tasks), chunk_size):
         chunk = tasks[i:i + chunk_size]
@@ -29,13 +33,31 @@ async def bulk_resolve(ip_list):
         
     return dict(all_results)
 
+
 # --- Main Execution ---
-df = pd.read_csv('your_file.csv')
-ip_list = df['ip_address'].tolist()
+if __name__ == '__main__':
+    # 1. Windows-specific fix for aiodns so it doesn't crash
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-loop = asyncio.get_event_loop()
-resolved_dict = loop.run_until_complete(bulk_resolve(ip_list))
+    # 2. Read your CSV
+    print("Reading CSV file...")
+    df = pd.read_csv('destination_ips.csv')
+    
+    # 3. Filter for unique IPs to save time
+    # This drops empty rows and ensures we only look up an IP once
+    unique_ips = df['dstaddr'].dropna().unique().tolist()
+    print(f"Found {len(unique_ips)} unique IPs out of {len(df)} total rows.")
 
-# Map results back to dataframe and save
-df['domain'] = df['ip_address'].map(resolved_dict)
-df.to_csv('resolved_200k.csv', index=False)
+    # 4. Start the async loop the modern way
+    resolved_dict = asyncio.run(bulk_resolve(unique_ips))
+
+    # 5. Map results back to the dataframe and save
+    print("Mapping results and saving to file...")
+    df['domain'] = df['dstaddr'].map(resolved_dict)
+    
+    # Fill in any missing ones (like the empty rows we dropped earlier)
+    df['domain'] = df['domain'].fillna("Invalid/No IP") 
+    
+    df.to_csv('resolved_200k.csv', index=False)
+    print("Finished! Saved as resolved_200k.csv")
