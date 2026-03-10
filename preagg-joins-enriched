@@ -1,16 +1,134 @@
+CREATE TABLE networkautomation.joined_logs_2_preagg
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://ist-network-intelligence-vpcflowlogs-curated/preaggregate/joined_logs_2_preagg/',
+    partitioned_by = ARRAY['account_id','region','year','month','day']
+)
+AS
+-- 1. CRUSH & EXTRACT: Aggregate base logs for the specific day and extract the first octet
+WITH crushed_logs AS (
+    SELECT 
+        account_id,
+        account_name,
+        region,
+        vpc_id,
+        application_id,
+        instance_id,
+        client_ip,
+        destination_ip,
+        dstport, -- ✅ Added dstport
+        domain,
+        pkt_dst_aws_service,
+        year,
+        month,
+        day,
+        SUM(total_bytes) AS total_bytes,
+        
+        -- Extract the First Octet for our high-speed Hash Join
+        CAST(split_part(destination_ip,'.',1) AS bigint) AS octet1,
+        
+        -- Compute the full integer for the precision check
+        (
+            CAST(split_part(destination_ip,'.',1) AS bigint) * 16777216 +
+            CAST(split_part(destination_ip,'.',2) AS bigint) * 65536 +
+            CAST(split_part(destination_ip,'.',3) AS bigint) * 256 +
+            CAST(split_part(destination_ip,'.',4) AS bigint)
+        ) AS ip_int
+    FROM joined_logs_2 -- ✅ Changed table to joined_logs_2
+    WHERE year = '2026' 
+      AND month = '02' 
+      AND day = '15' -- ✅ Hardcoded to 1 day for fast insertion
+      AND instance_id IS NOT NULL
+    GROUP BY 
+        account_id, account_name, region, vpc_id, application_id, 
+        instance_id, client_ip, destination_ip, dstport, domain, 
+        pkt_dst_aws_service, year, month, day
+),
+
+-- 2. GEO PREP: Extract the first octet for Country Blocks
+geo_prepared AS (
+    SELECT 
+        network_start_integer,
+        network_end_integer,
+        geoname_id,
+        CAST(network_start_integer / 16777216 AS bigint) AS octet1
+    FROM geo_country_blocks_range
+),
+
+-- 3. ASN PREP: Extract the first octet for ASN Blocks
+asn_prepared AS (
+    SELECT 
+        network_start_integer,
+        network_end_integer,
+        autonomous_system_organization,
+        CAST(network_start_integer / 16777216 AS bigint) AS octet1
+    FROM geo_asn_blocks_range
+),
+
+-- 4. AWS PREP: Extract the first octet for AWS IP Ranges
+aws_prepared AS (
+    SELECT 
+        network_start_int,
+        network_end_int,
+        service,
+        region,
+        CAST(network_start_int / 16777216 AS bigint) AS octet1
+    FROM networkautomation.aws_ip_ranges_int
+)
+
+-- 5. FINAL ASSEMBLY: The Blazing Fast Hash Join
 SELECT 
-    b.network_start_integer,
-    b.network_end_integer,
-    l.country_iso_code,
-    l.country_name,
-    l.continent_name,
-    a.autonomous_system_number,
-    a.autonomous_system_organization
-FROM geo_country_blocks_range b
--- 1. Explicitly cast geoname_id to match the string type in locations
-LEFT JOIN geo_country_locations l 
-    ON CAST(b.geoname_id AS varchar) = l.geoname_id
--- 2. Join ASN data. (Assuming the network ranges align exactly)
-LEFT JOIN geo_ans_block_range a 
-    ON b.network_start_integer = a.network_start_integer 
-    AND b.network_end_integer = a.network_end_integer
+    c.account_name,
+    c.application_id,
+    c.instance_id,
+    c.client_ip AS srcaddr,
+    c.destination_ip AS dstaddr,
+    c.dstport, -- ✅ Included in final output
+    c.domain AS query_name,
+    loc.country_name,
+    a.autonomous_system_organization AS asn_org,
+
+    -- Final Service Classification
+    CASE 
+        WHEN aws.service IS NULL THEN 'NON-AWS'
+        ELSE aws.service
+    END AS final_service_type,
+
+    aws.region AS aws_region,
+    CASE
+        WHEN aws.service IS NULL THEN 'Internet'
+        WHEN aws.region = c.region THEN 'Same-Region'
+        WHEN aws.region IS NOT NULL AND aws.region != c.region THEN 'Cross-Region'
+        ELSE 'Unknown'
+    END AS region_scope,
+
+    -- Renamed to avoid Parquet special character issues
+    CAST(c.total_bytes AS double) / (1024 * 1024 * 1024) AS data_out_gb, 
+    
+    -- PARTITIONS MUST BE LAST
+    c.account_id,
+    c.region,
+    c.year,
+    c.month,
+    c.day
+
+FROM crushed_logs c
+
+-- 🚨 Hash Join for Country Location 🚨
+LEFT JOIN geo_prepared g
+    ON c.octet1 = g.octet1  
+   AND c.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
+
+LEFT JOIN geo_country_locations loc 
+    ON g.geoname_id = loc.geoname_id
+
+-- 🚨 Hash Join for ASN 🚨
+LEFT JOIN asn_prepared a
+    ON c.octet1 = a.octet1  
+   AND c.ip_int BETWEEN a.network_start_integer AND a.network_end_integer
+
+-- 🚨 Hash Join for AWS Ranges 🚨
+LEFT JOIN aws_prepared aws
+    ON c.octet1 = aws.octet1 
+   AND c.ip_int BETWEEN aws.network_start_int AND aws.network_end_int
+   AND aws.service = c.pkt_dst_aws_service;
