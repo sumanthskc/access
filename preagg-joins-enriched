@@ -1,4 +1,4 @@
--- 1. TINY DICTIONARY: Get ONLY unique IPs (Removed octet1 hack)
+-- 1. TINY DICTIONARY: Get ONLY unique IPs 
 WITH unique_destinations AS (
     SELECT DISTINCT
         destination_ip,
@@ -16,7 +16,7 @@ WITH unique_destinations AS (
       AND year = '2026' AND month = '03' AND day = '10'
 ),
 
--- 2. RESOLVE IPS QUICKLY: Standard BETWEEN joins (Super fast because of the dictionary)
+-- 2. RESOLVE IPS QUICKLY: Standard BETWEEN joins
 resolved_ips AS (
     SELECT 
         u.destination_ip,
@@ -24,7 +24,7 @@ resolved_ips AS (
         loc.country_name,
         a.autonomous_system_organization AS asn_org,
         aws.service AS aws_service,
-        aws.aws_region
+        aws.region AS aws_region  -- ✅ THE FIX: Correctly aliasing the raw column
     FROM unique_destinations u
     
     -- Join Geo
