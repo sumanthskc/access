@@ -1,0 +1,124 @@
+CREATE TABLE networkautomation.vpc_egress_enriched_preagg
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://YOUR-BUCKET-NAME/preaggregate/vpc_egress_enriched_preagg/',
+    partitioned_by = ARRAY['account_id', 'region', 'year', 'month', 'day']
+)
+AS
+-- 1. CRUSH & EXTRACT: Group by all dimensions to shrink data, extract IP integer & octet1
+WITH crushed_logs AS (
+    SELECT
+        account_name,
+        account_id,
+        region,
+        vpc_id,
+        application_id,
+        instance_id,
+        client_ip AS srcaddr,
+        destination_ip AS dstaddr,
+        dstport,                  -- Added dstport
+        domain AS query_name,
+        pkt_dst_aws_service,
+        year,
+        month,
+        day,
+        SUM(total_bytes) AS total_bytes,
+        
+        -- First Octet for high-speed Hash Join
+        CAST(split_part(destination_ip,'.',1) AS bigint) AS octet1,
+        
+        -- Full integer for the precise BETWEEN check
+        (
+            CAST(split_part(destination_ip,'.',1) AS bigint) * 16777216 +
+            CAST(split_part(destination_ip,'.',2) AS bigint) * 65536 +
+            CAST(split_part(destination_ip,'.',3) AS bigint) * 256 +
+            CAST(split_part(destination_ip,'.',4) AS bigint)
+        ) AS ip_int
+    FROM joined_logs_2            -- Changed table name
+    WHERE instance_id IS NOT NULL
+    GROUP BY 
+        account_name, account_id, region, vpc_id, application_id, instance_id,
+        client_ip, destination_ip, dstport, domain, pkt_dst_aws_service, year, month, day,
+        CAST(split_part(destination_ip,'.',1) AS bigint)
+),
+
+-- 2. PREP GEO COUNTRY: Math extract octet1
+geo_prepared AS (
+    SELECT 
+        network_start_integer, network_end_integer, geoname_id,
+        CAST(network_start_integer / 16777216 AS bigint) AS octet1
+    FROM geo_country_blocks_range
+),
+
+-- 3. PREP ASN: Math extract octet1
+asn_prepared AS (
+    SELECT 
+        network_start_integer, network_end_integer, autonomous_system_organization,
+        CAST(network_start_integer / 16777216 AS bigint) AS octet1
+    FROM geo_asn_blocks_range
+),
+
+-- 4. PREP AWS RANGES: Math extract octet1
+aws_prepared AS (
+    SELECT 
+        network_start_int, network_end_int, service, region AS aws_region,
+        CAST(network_start_int / 16777216 AS bigint) AS octet1
+    FROM networkautomation.aws_ip_ranges_int
+)
+
+-- 5. FINAL ASSEMBLY: Blazing Fast Hash Joins across the board
+SELECT
+    c.account_name,
+    c.application_id,
+    c.instance_id,
+    c.vpc_id,
+    c.srcaddr,
+    c.dstaddr,
+    c.dstport,                    -- Included in final select
+    COALESCE(c.query_name, 'unknown') AS query_name,
+    loc.country_name,
+    a.autonomous_system_organization AS asn_org,
+    
+    -- ✅ Final Service Classification
+    CASE 
+        WHEN aws.service IS NULL THEN 'NON-AWS' 
+        ELSE aws.service 
+    END AS final_service_type,
+    
+    aws.aws_region,
+    CASE 
+        WHEN aws.service IS NULL THEN 'Internet'
+        WHEN aws.aws_region = c.region THEN 'Same-Region'
+        WHEN aws.aws_region IS NOT NULL AND aws.aws_region != c.region THEN 'Cross-Region'
+        ELSE 'Unknown'
+    END AS region_scope,
+    
+    (c.total_bytes) / (1024.0 * 1024.0 * 1024.0) AS data_out_gb,
+    c.total_bytes,
+
+    -- PARTITIONS MUST BE LAST IN CTAS
+    c.account_id,
+    c.region,
+    c.year,
+    c.month,
+    c.day
+
+FROM crushed_logs c
+
+-- Hash Join 1: Geo Country
+LEFT JOIN geo_prepared g 
+    ON c.octet1 = g.octet1 
+   AND c.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
+LEFT JOIN geo_country_locations loc 
+    ON g.geoname_id = loc.geoname_id
+
+-- Hash Join 2: ASN
+LEFT JOIN asn_prepared a 
+    ON c.octet1 = a.octet1 
+   AND c.ip_int BETWEEN a.network_start_integer AND a.network_end_integer
+
+-- Hash Join 3: AWS Ranges (Notice we include the service match here too)
+LEFT JOIN aws_prepared aws 
+    ON c.octet1 = aws.octet1 
+   AND c.ip_int BETWEEN aws.network_start_int AND aws.network_end_int
+   AND aws.service = c.pkt_dst_aws_service;
