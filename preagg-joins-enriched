@@ -1,96 +1,16 @@
--- 1. TINY DICTIONARY: Get ONLY unique IPs 
-WITH unique_destinations AS (
-    SELECT DISTINCT
-        destination_ip,
-        pkt_dst_aws_service,
-        (
-            CAST(split_part(destination_ip,'.',1) AS bigint) * 16777216 +
-            CAST(split_part(destination_ip,'.',2) AS bigint) * 65536 +
-            CAST(split_part(destination_ip,'.',3) AS bigint) * 256 +
-            CAST(split_part(destination_ip,'.',4) AS bigint)
-        ) AS ip_int
-    FROM joined_logs_2
-    WHERE instance_id IS NOT NULL 
-      AND destination_ip IS NOT NULL
-      -- 🛑 Partition filter for quick testing
-      AND year = '2026' AND month = '03' AND day = '10'
-),
-
--- 2. RESOLVE IPS QUICKLY: Standard BETWEEN joins
-resolved_ips AS (
-    SELECT 
-        u.destination_ip,
-        u.pkt_dst_aws_service,
-        loc.country_name,
-        a.autonomous_system_organization AS asn_org,
-        aws.service AS aws_service,
-        aws.region AS aws_region  -- ✅ THE FIX: Correctly aliasing the raw column
-    FROM unique_destinations u
-    
-    -- Join Geo
-    LEFT JOIN geo_country_blocks_range g 
-        ON u.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
-    LEFT JOIN geo_country_locations loc 
-        ON g.geoname_id = loc.geoname_id
-        
-    -- Join ASN
-    LEFT JOIN geo_asn_blocks_range a 
-        ON u.ip_int BETWEEN a.network_start_integer AND a.network_end_integer
-        
-    -- Join AWS
-    LEFT JOIN networkautomation.aws_ip_ranges_int aws 
-        ON u.ip_int BETWEEN aws.network_start_int AND aws.network_end_int
-       AND aws.service = u.pkt_dst_aws_service
-)
-
--- 3. FINAL ASSEMBLY
-SELECT
-    c.account_name,
-    c.application_id,
-    c.instance_id,
-    c.vpc_id,
-    c.client_ip AS srcaddr,
-    c.destination_ip AS dstaddr,
-    c.dstport,
-    COALESCE(c.domain, 'unknown') AS query_name,
-    r.country_name,
-    r.asn_org,
-    
-    CASE 
-        WHEN r.aws_service IS NULL THEN 'NON-AWS' 
-        ELSE r.aws_service 
-    END AS final_service_type,
-    
-    r.aws_region,
-    CASE 
-        WHEN r.aws_service IS NULL THEN 'Internet'
-        WHEN r.aws_region = c.region THEN 'Same-Region'
-        WHEN r.aws_region IS NOT NULL AND r.aws_region != c.region THEN 'Cross-Region'
-        ELSE 'Unknown'
-    END AS region_scope,
-    
-    SUM(c.total_bytes) / (1024.0 * 1024.0 * 1024.0) AS data_out_gb,
-    SUM(c.total_bytes) AS total_bytes,
-    c.account_id,
-    c.region,
-    c.year,
-    c.month,
-    c.day
-
-FROM joined_logs_2 c
-LEFT JOIN resolved_ips r 
-    ON c.destination_ip = r.destination_ip 
-   AND COALESCE(c.pkt_dst_aws_service, 'NON-AWS') = COALESCE(r.pkt_dst_aws_service, 'NON-AWS')
-
-WHERE c.instance_id IS NOT NULL
-  -- 🛑 Partition filter for quick testing
-  AND c.year = '2026' AND c.month = '03' AND c.day = '10'
-
-GROUP BY 
-    c.account_name, c.application_id, c.instance_id, c.vpc_id,
-    c.client_ip, c.destination_ip, c.dstport, c.domain,
-    r.country_name, r.asn_org, r.aws_service, r.aws_region,
-    c.region, c.account_id, c.year, c.month, c.day
-
--- 🛑 Limit to return fast
-LIMIT 100;
+SELECT 
+    b.network_start_integer,
+    b.network_end_integer,
+    l.country_iso_code,
+    l.country_name,
+    l.continent_name,
+    a.autonomous_system_number,
+    a.autonomous_system_organization
+FROM geo_country_blocks_range b
+-- 1. Explicitly cast geoname_id to match the string type in locations
+LEFT JOIN geo_country_locations l 
+    ON CAST(b.geoname_id AS varchar) = l.geoname_id
+-- 2. Join ASN data. (Assuming the network ranges align exactly)
+LEFT JOIN geo_ans_block_range a 
+    ON b.network_start_integer = a.network_start_integer 
+    AND b.network_end_integer = a.network_end_integer
