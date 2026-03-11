@@ -5,7 +5,6 @@ CREATE TABLE "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.joined_l
     instance_id string,
     srcaddr string,
     dstaddr string,
-    dstport int,
     query_name string,
     country_name string,
     asn_org string,
@@ -46,7 +45,6 @@ SELECT
     u.instance_id,
     u.client_ip AS srcaddr,
     u.destination_ip AS dstaddr,
-    u.destination_port AS dstport,
     u.domain AS query_name,
     loc.country_name,
     a.autonomous_system_organization AS asn_org,
@@ -64,7 +62,7 @@ SELECT
     
     u.total_bytes,
     
-    -- ✅ Partition columns explicitly placed at the end in correct order
+    -- Partition columns explicitly placed at the end in correct order
     u.account_id,
     u.region,
     u.vpc_id,
