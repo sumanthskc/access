@@ -1,29 +1,3 @@
-CREATE TABLE "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.joined_logs (
-    account_name string,
-    biz_units string,
-    application_id string,
-    instance_id string,
-    srcaddr string,
-    dstaddr string,
-    query_name string,
-    country_name string,
-    asn_org string,
-    final_service_type string,
-    aws_region string,
-    region_scope string,
-    total_bytes bigint,
-    
-    -- Partition columns placed at the end
-    account_id string,
-    region string,
-    vpc_id string,
-    year string,
-    month string,
-    day string
-)
-PARTITIONED BY (account_id, region, vpc_id, year, month, day);
-
-
 INSERT INTO "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.joined_logs
 WITH base_logs AS (
     SELECT 
@@ -37,6 +11,10 @@ WITH base_logs AS (
         ) AS ip_int
     FROM "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.raw_flow_logs
     WHERE instance_id IS NOT NULL
+      -- Limit the insert to a single day to save time and compute
+      AND year = '2026'
+      AND month = '02'
+      AND day = '15'
 )
 SELECT
     u.account_name,
@@ -72,7 +50,7 @@ SELECT
 
 FROM base_logs u
 
--- Execute the IP lookups
+-- Execute the IP lookups only on the filtered day's data
 LEFT JOIN geo_country_blocks_range g 
     ON u.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
 LEFT JOIN geo_country_locations loc 
