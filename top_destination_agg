@@ -1,0 +1,83 @@
+CREATE TABLE "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.domain_traffic_summary (
+    domain string,
+    destination_ip string,
+    dstport int,
+    gb_transferred double,
+    country_name string,
+    
+    -- Partition columns explicitly placed at the end
+    account_id string,
+    region string,
+    vpc_id string,
+    year string,
+    month string,
+    day string
+)
+PARTITIONED BY (account_id, region, vpc_id, year, month, day);
+
+
+INSERT INTO "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.domain_traffic_summary
+WITH daily_grouped AS (
+    -- Step 1: Filter to a single day and aggregate bytes BEFORE ranking
+    SELECT
+        account_id,
+        vpc_id,
+        region,
+        domain,
+        destination_ip,
+        dstport,
+        year,
+        month,
+        day,
+        ROUND(SUM(total_bytes) / 1073741824.0, 2) AS gb_transferred
+    FROM "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.raw_flow_logs -- or joined_logs_2 depending on your raw source
+    WHERE domain IS NOT NULL
+      AND domain != ''
+      AND year = '2026'
+      AND month = '02'
+      AND day = '20'
+    GROUP BY account_id, vpc_id, region, domain, destination_ip, dstport, year, month, day
+),
+ranked_domains AS (
+    -- Step 2: Rank domains by GB transferred within each Account, Region, VPC, and Port
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY account_id, region, vpc_id, dstport 
+            ORDER BY gb_transferred DESC
+        ) AS rnk
+    FROM daily_grouped
+),
+top_domains AS (
+    -- Step 3: Filter out the noise and calculate the IP integer ONLY for the Top 300
+    SELECT 
+        *,
+        (
+          CAST(SPLIT_PART(destination_ip, '.', 1) AS BIGINT) * 16777216 +
+          CAST(SPLIT_PART(destination_ip, '.', 2) AS BIGINT) * 65536 +
+          CAST(SPLIT_PART(destination_ip, '.', 3) AS BIGINT) * 256 +
+          CAST(SPLIT_PART(destination_ip, '.', 4) AS BIGINT)
+        ) AS ip_int
+    FROM ranked_domains
+    WHERE rnk <= 300 -- This is the critical filter that was missing!
+)
+-- Step 4: Execute the heavy Geo Joins on the tiny remaining dataset
+SELECT
+    u.domain,
+    u.destination_ip,
+    u.dstport,
+    u.gb_transferred,
+    loc.country_name,
+    
+    -- Partition columns placed in exact order at the end
+    u.account_id,
+    u.region,
+    u.vpc_id,
+    u.year,
+    u.month,
+    u.day
+FROM top_domains u
+LEFT JOIN networkautomation.geo_country_blocks_range cb
+    ON u.ip_int BETWEEN cb.network_start_integer AND cb.network_end_integer
+LEFT JOIN networkautomation.geo_country_locations loc
+    ON cb.geoname_id = loc.geoname_id;
