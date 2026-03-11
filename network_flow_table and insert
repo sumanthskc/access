@@ -1,20 +1,35 @@
 INSERT INTO "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.joined_logs
-WITH base_logs AS (
+WITH daily_raw AS (
+    -- Step 1: Filter to a single day
+    SELECT *
+    FROM "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.raw_flow_logs
+    WHERE instance_id IS NOT NULL
+      AND year = '2026'
+      AND month = '02'
+      AND day = '16'
+),
+ranked_flows AS (
+    -- Step 2: Rank flows by total_bytes within each Account, Region, and VPC
     SELECT 
         *,
-        -- Convert IP to Integer for the JOINs
+        ROW_NUMBER() OVER(
+            PARTITION BY account_id, region, vpc_id 
+            ORDER BY total_bytes DESC
+        ) as rnk
+    FROM daily_raw
+),
+top_flows AS (
+    -- Step 3: Keep only the Top 300 per group, and calculate the IP integer
+    SELECT 
+        *,
         (
           CAST(split_part(destination_ip, '.', 1) AS bigint) * 16777216 +
           CAST(split_part(destination_ip, '.', 2) AS bigint) * 65536 +
           CAST(split_part(destination_ip, '.', 3) AS bigint) * 256 +
           CAST(split_part(destination_ip, '.', 4) AS bigint)
         ) AS ip_int
-    FROM "s3tablescatalog/vpc-flow-logs-table-bucket".vpc_flow_logs.raw_flow_logs
-    WHERE instance_id IS NOT NULL
-      -- Limit the insert to a single day to save time and compute
-      AND year = '2026'
-      AND month = '02'
-      AND day = '15'
+    FROM ranked_flows
+    WHERE rnk <= 300
 )
 SELECT
     u.account_name,
@@ -48,9 +63,9 @@ SELECT
     u.month,
     u.day
 
-FROM base_logs u
+FROM top_flows u
 
--- Execute the IP lookups only on the filtered day's data
+-- Step 4: Execute the heavy IP lookups ONLY on the filtered top rows
 LEFT JOIN geo_country_blocks_range g 
     ON u.ip_int BETWEEN g.network_start_integer AND g.network_end_integer
 LEFT JOIN geo_country_locations loc 
