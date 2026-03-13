@@ -1,0 +1,86 @@
+WITH dns_logs AS (
+    SELECT 
+        account_id, 
+        vpc_id, 
+        srcaddr AS client_ip, 
+        query_name AS domain, 
+        ans.rdata AS resolved_ip,
+        rcode,
+        from_iso8601_timestamp(query_timestamp) AS dns_time,
+        date_trunc('hour', from_iso8601_timestamp(query_timestamp)) AS hour_bucket
+    FROM route53_vpc_dns_query_logs_curated
+    LEFT JOIN UNNEST(answers) as t_ans(ans) 
+    WHERE day = '17' -- Test filter: Restrict to a single partition
+),
+
+flow_logs AS (
+    SELECT 
+        account_id, 
+        region, 
+        vpc_id, 
+        instance_id, 
+        interface_id,
+        pkt_srcaddr, 
+        pkt_dstaddr, 
+        pkt_dst_aws_service, 
+        traffic_path,
+        bytes, 
+        packets,
+        from_unixtime(start_time) AS flow_start_time,
+        date_trunc('hour', from_unixtime(start_time)) AS hour_bucket,
+        year, month, day
+    FROM vpc_flow_logs_curated
+    WHERE flow_direction = 'egress' 
+      AND log_status = 'OK'
+      AND (tcp_flags = 2 OR protocol = 17)
+      AND day = '17' -- Test filter: Restrict to a single partition
+),
+
+joined_data AS (
+    SELECT 
+        v.account_id,
+        v.region,
+        v.vpc_id,
+        v.instance_id,
+        v.pkt_srcaddr,
+        v.pkt_dstaddr,
+        r.domain, 
+        v.pkt_dst_aws_service, 
+        v.traffic_path,
+        v.bytes,
+        v.packets,
+        v.year, v.month, v.day,
+        ROW_NUMBER() OVER (
+            PARTITION BY v.interface_id, v.pkt_srcaddr, v.pkt_dstaddr, v.flow_start_time 
+            ORDER BY r.dns_time DESC
+        ) as row_num
+    FROM flow_logs v
+    LEFT JOIN dns_logs r 
+        ON v.hour_bucket = r.hour_bucket
+        AND v.pkt_srcaddr = r.client_ip
+        AND v.pkt_dstaddr = r.resolved_ip
+        AND v.vpc_id = r.vpc_id
+        AND v.account_id = r.account_id
+        AND v.flow_start_time BETWEEN r.dns_time AND (r.dns_time + INTERVAL '10' MINUTE)
+)
+
+SELECT 
+    account_id,
+    region,
+    vpc_id,
+    instance_id,
+    pkt_srcaddr AS client_ip,
+    pkt_dstaddr AS destination_ip,
+    domain, 
+    pkt_dst_aws_service, 
+    traffic_path,
+    SUM(bytes) AS total_bytes,
+    SUM(packets) AS total_packets,
+    year, month, day
+FROM joined_data
+WHERE row_num = 1 
+GROUP BY 
+    account_id, region, vpc_id, instance_id, pkt_srcaddr, 
+    pkt_dstaddr, domain, pkt_dst_aws_service, traffic_path,
+    year, month, day
+LIMIT 1000; -- Limit the final output to 1000 rows for testing
