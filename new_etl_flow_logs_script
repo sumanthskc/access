@@ -2,7 +2,8 @@ import sys
 from awsglue.context import GlueContext
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
-from pyspark.sql.functions import split, col, input_file_name, when
+from pyspark.sql.functions import split, col, input_file_name, when, lit
+from pyspark.sql.types import IntegerType, LongType
 
 # =========================================================
 # INIT
@@ -15,86 +16,156 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 
 # =========================================================
-# PRODUCTION PERFORMANCE TUNING
+# PERFORMANCE TUNING
+# (Optimized for 10 DPUs / G.1X, ~16GB GZ → 80-100GB expanded, 9999+ files)
 # =========================================================
-# 1. Group small files to prevent S3 throttling
-spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
-spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
+
+# --- Serialization ---
+spark.conf.set("spark.serializer",   "org.apache.spark.serializer.KryoSerializer")
+spark.conf.set("spark.kryo.unsafe",  "true")
+
+# --- Adaptive Query Execution ---
+# Spark re-optimizes at runtime: coalesces empty shuffle partitions,
+# handles skew automatically, converts joins to broadcast where possible.
+spark.conf.set("spark.sql.adaptive.enabled",                          "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled",       "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled",                 "true")
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes",     "256mb")
+
+# --- Input file grouping ---
+# 256MB threshold aggressively merges 9999+ tiny GZ files into fewer tasks.
+# openCostInBytes matching maxPartitionBytes is critical for tiny-file workloads.
+spark.conf.set("spark.sql.files.maxPartitionBytes", "268435456")  # 256 MB
+spark.conf.set("spark.sql.files.openCostInBytes",   "268435456")  # 256 MB
+
+# --- Shuffle ---
+# 9 workers x 4 cores = 36 vCPUs
+# 100GB expanded / 36 cores → 200 partitions keeps each partition ~500MB (safe for sort)
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+
+# --- S3 throughput ---
+spark.conf.set("mapreduce.input.fileinputformat.list-status.num-threads",    "128")
+spark.conf.set("spark.sql.parquet.fs.optimized.committer.optimization-enabled", "true")
+spark.conf.set("spark.hadoop.fs.s3a.fast.upload",                            "true")
+
+# --- Output format ---
 spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
 
-# 2. Safe Reruns
+# --- Straggler protection ---
+# Re-launches tasks running 2x longer than the median (kills tail latency).
+spark.conf.set("spark.speculation",            "true")
+spark.conf.set("spark.speculation.multiplier", "2")
+spark.conf.set("spark.speculation.quantile",   "0.9")
+
+# --- Safe reruns ---
+# Overwrite only the specific partition being processed, not the entire table.
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-# 3. S3 Read/Write Speed Fixes
-spark.conf.set("mapreduce.input.fileinputformat.list-status.num-threads", "100")
-spark.conf.set("spark.sql.parquet.fs.optimized.committer.optimization-enabled", "true")
-
 # =========================================================
-# PATHS & TARGETED ACCOUNTS
+# PATHS
 # =========================================================
 TARGET_ACCOUNTS = ["048551427371", "898302938380"]
 
+# Explicit per-account paths — S3 never lists other accounts' prefixes.
+# Cheaper than wildcard + post-read filter (fewer LIST calls, less data scanned).
 INPUT_PATHS = [
     f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/{account}/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
     for account in TARGET_ACCOUNTS
 ]
-
 OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
 
 # =========================================================
-# 1. READ WITH DYNAMIC HEADERS
+# 1. READ
+# spark.read.csv() accepts a list of paths natively —
+# no union, no loop, single scan job internally.
 # =========================================================
-raw_df = spark.read.option("header", "true").option("sep", " ").csv(INPUT_PATHS)
+raw_df = spark.read \
+    .option("header", "true") \
+    .option("sep",    " ") \
+    .csv(INPUT_PATHS)
 
 if raw_df.isEmpty():
-    print(f"⚠️ WARNING: No files found for {PROCESS_DATE}. Exiting gracefully.")
+    print(f"⚠️  No files found for {PROCESS_DATE}. Exiting gracefully.")
     sys.exit(0)
 
 # =========================================================
-# 2. SINGLE-PASS TRANSFORMATIONS (Crucial for Speed)
+# 2. BATCH TRANSFORM: normalize + cast + rename in ONE select pass
+#
+# Why not iterative withColumn?
+#   Each withColumn appends a node to Spark's logical plan.
+#   20+ columns = 20+ nested plan nodes Catalyst must traverse.
+#   A single select() is one flat projection — resolved in one pass.
 # =========================================================
-select_exprs = []
+INT_COLS    = {"version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"}
+BIGINT_COLS = {"packets", "bytes", "start_time", "end_time"}
+RESERVE_MAP = {"start": "start_time", "end": "end_time"}  # Reserved word renames
 
-for c in raw_df.columns:
-    clean_name = c.replace("-", "_").lower()
-    if clean_name == "start": clean_name = "start_time"
-    if clean_name == "end": clean_name = "end_time"
-    
-    col_expr = when(col(c) == "-", None).otherwise(col(c))
-    
-    if clean_name in ["version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"]:
-        col_expr = col_expr.cast("integer")
-    elif clean_name in ["packets", "bytes", "start_time", "end_time"]:
-        col_expr = col_expr.cast("bigint")
-        
-    select_exprs.append(col_expr.alias(clean_name))
+def build_col_expr(raw_name):
+    """
+    Single expression per column:
+      1. Clean name  (hyphens → underscores, lowercase, reserved word remap)
+      2. Null-normalize  ("-" → NULL)
+      3. Cast  (int / bigint where needed)
+      4. Alias to clean name
+    """
+    clean_name = raw_name.replace("-", "_").lower()
+    clean_name = RESERVE_MAP.get(clean_name, clean_name)
 
-# Extract partition path info simultaneously
+    expr = when(col(raw_name) == "-", lit(None)).otherwise(col(raw_name))
+
+    if clean_name in INT_COLS:
+        expr = expr.cast(IntegerType())
+    elif clean_name in BIGINT_COLS:
+        expr = expr.cast(LongType())
+
+    return expr.alias(clean_name)
+
+# Build all data column expressions
+select_exprs = [build_col_expr(c) for c in raw_df.columns]
+
+# Append partition columns derived from file path (single pass, no extra stage)
 path_col = split(input_file_name(), "/")
 select_exprs.extend([
     path_col.getItem(4).alias("account_id"),
     path_col.getItem(6).alias("region"),
     path_col.getItem(7).alias("year"),
     path_col.getItem(8).alias("month"),
-    path_col.getItem(9).alias("day")
+    path_col.getItem(9).alias("day"),
 ])
 
 df = raw_df.select(*select_exprs)
 
 # =========================================================
-# 3. WRITE PARQUET (10 DPU / 36 vCPU OPTIMIZED)
+# 3. REPARTITION + SORT
+#
+# repartition(200):
+#   - Feeds all 36 vCPUs across 5-6 waves (keeps pipeline full)
+#   - ~500MB per partition — safe headroom for sort shuffle (500MB x2 peak)
+#
+# sortWithinPartitions (not orderBy):
+#   - Sorts data locally within each partition (no global shuffle)
+#   - Improves Parquet encoding efficiency → better Athena scan performance
+#   - Does NOT trigger a second full shuffle (unlike orderBy)
 # =========================================================
-# Repartitioning to 100 perfectly feeds 36 worker cores.
 df_final = (
-    df.repartition(100)
+    df.repartition(200)
       .sortWithinPartitions("account_id", "region", "year", "month", "day")
 )
 
+# =========================================================
+# 4. WRITE PARQUET
+#
+# maxRecordsPerFile:
+#   Caps output file size per partition — prevents S3 PutObject throttling
+#   (3,500 PUT/s per prefix limit) when a partition is skewed/large.
+#   AQE coalesces leftover empty shuffle partitions automatically.
+# =========================================================
 (
     df_final.write
-      .mode("overwrite") 
+      .mode("overwrite")
       .partitionBy("account_id", "region", "year", "month", "day")
+      .option("maxRecordsPerFile", 1_500_000)
       .parquet(OUTPUT_PATH)
 )
 
-print(f"✅ PRODUCTION Run completed successfully for {PROCESS_DATE}")
+print(f"✅ Optimized run completed successfully for {PROCESS_DATE}")
