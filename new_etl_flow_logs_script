@@ -1,0 +1,100 @@
+import sys
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql.functions import split, col, input_file_name, when
+
+# =========================================================
+# INIT
+# =========================================================
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'PROCESS_DATE'])
+PROCESS_DATE = args['PROCESS_DATE']
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# =========================================================
+# PRODUCTION PERFORMANCE TUNING
+# =========================================================
+# 1. Group small files to prevent S3 throttling
+spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")
+spark.conf.set("spark.sql.files.openCostInBytes", "134217728")
+spark.conf.set("spark.sql.parquet.compression.codec", "snappy")
+
+# 2. Safe Reruns
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+# 3. S3 Read/Write Speed Fixes
+spark.conf.set("mapreduce.input.fileinputformat.list-status.num-threads", "100")
+spark.conf.set("spark.sql.parquet.fs.optimized.committer.optimization-enabled", "true")
+
+# =========================================================
+# PATHS & TARGETED ACCOUNTS
+# =========================================================
+TARGET_ACCOUNTS = ["048551427371", "898302938380"]
+
+INPUT_PATHS = [
+    f"s3://ist-network-intelligence-vpcflowlogs/AWSLogs/{account}/vpcflowlogs/*/{PROCESS_DATE}/*.gz"
+    for account in TARGET_ACCOUNTS
+]
+
+OUTPUT_PATH = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
+
+# =========================================================
+# 1. READ WITH DYNAMIC HEADERS
+# =========================================================
+raw_df = spark.read.option("header", "true").option("sep", " ").csv(INPUT_PATHS)
+
+if raw_df.isEmpty():
+    print(f"⚠️ WARNING: No files found for {PROCESS_DATE}. Exiting gracefully.")
+    sys.exit(0)
+
+# =========================================================
+# 2. SINGLE-PASS TRANSFORMATIONS (Crucial for Speed)
+# =========================================================
+select_exprs = []
+
+for c in raw_df.columns:
+    clean_name = c.replace("-", "_").lower()
+    if clean_name == "start": clean_name = "start_time"
+    if clean_name == "end": clean_name = "end_time"
+    
+    col_expr = when(col(c) == "-", None).otherwise(col(c))
+    
+    if clean_name in ["version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"]:
+        col_expr = col_expr.cast("integer")
+    elif clean_name in ["packets", "bytes", "start_time", "end_time"]:
+        col_expr = col_expr.cast("bigint")
+        
+    select_exprs.append(col_expr.alias(clean_name))
+
+# Extract partition path info simultaneously
+path_col = split(input_file_name(), "/")
+select_exprs.extend([
+    path_col.getItem(4).alias("account_id"),
+    path_col.getItem(6).alias("region"),
+    path_col.getItem(7).alias("year"),
+    path_col.getItem(8).alias("month"),
+    path_col.getItem(9).alias("day")
+])
+
+df = raw_df.select(*select_exprs)
+
+# =========================================================
+# 3. WRITE PARQUET (10 DPU / 36 vCPU OPTIMIZED)
+# =========================================================
+# Repartitioning to 100 perfectly feeds 36 worker cores.
+df_final = (
+    df.repartition(100)
+      .sortWithinPartitions("account_id", "region", "year", "month", "day")
+)
+
+(
+    df_final.write
+      .mode("overwrite") 
+      .partitionBy("account_id", "region", "year", "month", "day")
+      .parquet(OUTPUT_PATH)
+)
+
+print(f"✅ PRODUCTION Run completed successfully for {PROCESS_DATE}")
