@@ -112,3 +112,55 @@ df_final = (
 )
 
 print(f"✅ PRODUCTION Run completed successfully for {PROCESS_DATE}")
+
+
+
+
+
+===============================================================================
+# =========================================================
+# 2. BATCH TRANSFORM
+# =========================================================
+INT_COLS    = {"version", "srcport", "dstport", "protocol", "tcp_flags", "traffic_path"}
+BIGINT_COLS = {"packets", "bytes", "start_time", "end_time"}
+RESERVE_MAP = {"start": "start_time", "end": "end_time"}
+
+# The columns we will extract from the S3 path. 
+# We skip these if they exist in the raw CSV to prevent duplicates.
+PARTITION_COLS = {"account_id", "region", "year", "month", "day"}
+
+def build_col_expr(raw_name):
+    clean_name = raw_name.replace("-", "_").lower()
+    clean_name = RESERVE_MAP.get(clean_name, clean_name)
+
+    expr = when(col(raw_name) == "-", lit(None)).otherwise(col(raw_name))
+
+    if clean_name in INT_COLS:
+        expr = expr.cast(IntegerType())
+    elif clean_name in BIGINT_COLS:
+        expr = expr.cast(LongType())
+
+    return expr.alias(clean_name)
+
+select_exprs = []
+for c in raw_df.columns:
+    clean_name = c.replace("-", "_").lower()
+    clean_name = RESERVE_MAP.get(clean_name, clean_name)
+    
+    # FIX: Skip columns that we are about to pull from the S3 path
+    if clean_name in PARTITION_COLS:
+        continue
+        
+    select_exprs.append(build_col_expr(c))
+
+# Extract partition path info simultaneously (these become the authoritative columns)
+path_col = split(input_file_name(), "/")
+select_exprs.extend([
+    path_col.getItem(4).alias("account_id"),
+    path_col.getItem(6).alias("region"),
+    path_col.getItem(7).alias("year"),
+    path_col.getItem(8).alias("month"),
+    path_col.getItem(9).alias("day"),
+])
+
+df = raw_df.select(*select_exprs)
