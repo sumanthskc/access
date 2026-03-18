@@ -1,0 +1,55 @@
+SELECT
+    -- Organizational & Geographic Dimensions
+    account_id,
+    region,
+    az_id,
+    
+    -- Network Infrastructure
+    vpc_id,
+    subnet_id,
+    instance_id,
+    interface_id,
+    type AS eni_type,
+    
+    -- Traffic Identification (IPs & Ports)
+    srcaddr AS source_ip,
+    dstaddr AS destination_ip,
+    srcport,
+    dstport,
+    
+    -- AWS specific metadata
+    pkt_src_aws_service,
+    pkt_dst_aws_service,
+    flow_direction,
+    traffic_path,
+    
+    -- Protocol & Action
+    protocol,
+    CASE 
+        WHEN protocol = 6 THEN 'TCP'
+        WHEN protocol = 17 THEN 'UDP'
+        WHEN protocol = 1 THEN 'ICMP'
+        ELSE CAST(protocol AS VARCHAR) 
+    END AS protocol_name,
+    action,
+    tcp_flags,
+
+    -- Time Dimensions (Optimized for Power BI Calendars)
+    CAST(CONCAT(year, '-', month, '-', day) AS DATE) AS log_date,
+    year,
+    month,
+    day,
+    
+    -- Aggregated Metrics
+    SUM(bytes) AS total_bytes,
+    SUM(packets) AS total_packets,
+    COUNT(*) AS flow_record_count
+FROM vpc_flow_logs_curated
+WHERE log_status = 'OK'
+GROUP BY 
+    account_id, region, az_id,
+    vpc_id, subnet_id, instance_id, interface_id, type,
+    srcaddr, dstaddr, srcport, dstport,
+    pkt_src_aws_service, pkt_dst_aws_service, flow_direction, traffic_path,
+    protocol, action, tcp_flags,
+    year, month, day;
