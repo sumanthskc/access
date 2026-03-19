@@ -73,3 +73,40 @@ CREATE INDEX idx_vpc_action      ON vpc_flow_logs_curated (action);
 CREATE INDEX idx_vpc_date_action ON vpc_flow_logs_curated (log_date, action);
 CREATE INDEX idx_vpc_vpc_date    ON vpc_flow_logs_curated (vpc_id, log_date);
 CREATE INDEX idx_vpc_acc_region  ON vpc_flow_logs_curated (account_id, region);
+
+
+
+DO $$
+DECLARE
+    d DATE;
+    partition_name TEXT;
+BEGIN
+    d := '2026-02-15';   -- start date
+
+    WHILE d <= '2026-02-28' LOOP
+        partition_name := 'vpc_logs_' || TO_CHAR(d, 'YYYY_MM_DD');
+
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF vpc_flow_logs_curated
+             FOR VALUES FROM (%L) TO (%L)',
+            partition_name,
+            d,
+            d + INTERVAL '1 day'
+        );
+
+        RAISE NOTICE 'Created partition: %', partition_name;
+
+        d := d + INTERVAL '1 day';
+    END LOOP;
+END $$;
+```
+
+---
+
+## What This Creates
+```
+vpc_logs_2026_02_15   → Feb 15
+vpc_logs_2026_02_16   → Feb 16
+vpc_logs_2026_02_17   → Feb 17
+...
+vpc_logs_2026_02_28   → Feb 28
