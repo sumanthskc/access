@@ -1,4 +1,3 @@
--- Parent table
 CREATE TABLE vpc_flow_logs_curated (
     version             INT,
     log_account_id      VARCHAR(20),
@@ -35,60 +34,44 @@ CREATE TABLE vpc_flow_logs_curated (
     month               VARCHAR(2),
     day                 VARCHAR(2),
     log_date DATE GENERATED ALWAYS AS (
-        TO_DATE(year || '-' || month || '-' || day, 'YYYY-MM-DD')
+        (year || '-' || month || '-' || day)::DATE
     ) STORED
 ) PARTITION BY RANGE (log_date);
 
--- 2026 monthly partitions (manual)
-CREATE TABLE vpc_logs_2026_01 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+-- Auto-create all 12 partitions for 2026
+DO $$
+DECLARE
+    m INT;
+    start_date DATE;
+    end_date DATE;
+    partition_name TEXT;
+BEGIN
+    FOR m IN 1..12 LOOP
+        start_date     := DATE_TRUNC('month', TO_DATE('2026-' || LPAD(m::TEXT, 2, '0') || '-01', 'YYYY-MM-DD'));
+        end_date       := start_date + INTERVAL '1 month';
+        partition_name := 'vpc_logs_2026_' || LPAD(m::TEXT, 2, '0');
 
-CREATE TABLE vpc_logs_2026_02 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF vpc_flow_logs_curated
+             FOR VALUES FROM (%L) TO (%L)',
+            partition_name, start_date, end_date
+        );
 
-CREATE TABLE vpc_logs_2026_03 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+        RAISE NOTICE 'Created partition: %', partition_name;
+    END LOOP;
+END $$;
 
-CREATE TABLE vpc_logs_2026_04 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-
-CREATE TABLE vpc_logs_2026_05 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
-
-CREATE TABLE vpc_logs_2026_06 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
-
-CREATE TABLE vpc_logs_2026_07 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
-
-CREATE TABLE vpc_logs_2026_08 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
-
-CREATE TABLE vpc_logs_2026_09 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
-
-CREATE TABLE vpc_logs_2026_10 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
-
-CREATE TABLE vpc_logs_2026_11 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
-
-CREATE TABLE vpc_logs_2026_12 PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
-
--- Default partition catches anything outside defined ranges
+-- Default partition (catches data outside 2026)
 CREATE TABLE vpc_logs_default PARTITION OF vpc_flow_logs_curated DEFAULT;
 
-
-CREATE INDEX idx_vpc_log_date     ON vpc_flow_logs_curated (log_date);
-CREATE INDEX idx_vpc_account_id   ON vpc_flow_logs_curated (account_id);
-CREATE INDEX idx_vpc_region       ON vpc_flow_logs_curated (region);
-CREATE INDEX idx_vpc_vpc_id       ON vpc_flow_logs_curated (vpc_id);
-CREATE INDEX idx_vpc_srcaddr      ON vpc_flow_logs_curated (srcaddr);
-CREATE INDEX idx_vpc_dstaddr      ON vpc_flow_logs_curated (dstaddr);
-CREATE INDEX idx_vpc_action       ON vpc_flow_logs_curated (action);
-CREATE INDEX idx_vpc_date_action  ON vpc_flow_logs_curated (log_date, action);
-CREATE INDEX idx_vpc_vpc_date     ON vpc_flow_logs_curated (vpc_id, log_date);
-CREATE INDEX idx_vpc_acc_region   ON vpc_flow_logs_curated (account_id, region);
-
-
+-- Indexes
+CREATE INDEX idx_vpc_log_date    ON vpc_flow_logs_curated (log_date);
+CREATE INDEX idx_vpc_account_id  ON vpc_flow_logs_curated (account_id);
+CREATE INDEX idx_vpc_region      ON vpc_flow_logs_curated (region);
+CREATE INDEX idx_vpc_vpc_id      ON vpc_flow_logs_curated (vpc_id);
+CREATE INDEX idx_vpc_srcaddr     ON vpc_flow_logs_curated (srcaddr);
+CREATE INDEX idx_vpc_dstaddr     ON vpc_flow_logs_curated (dstaddr);
+CREATE INDEX idx_vpc_action      ON vpc_flow_logs_curated (action);
+CREATE INDEX idx_vpc_date_action ON vpc_flow_logs_curated (log_date, action);
+CREATE INDEX idx_vpc_vpc_date    ON vpc_flow_logs_curated (vpc_id, log_date);
+CREATE INDEX idx_vpc_acc_region  ON vpc_flow_logs_curated (account_id, region);
