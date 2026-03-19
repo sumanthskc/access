@@ -1,0 +1,94 @@
+-- Parent table
+CREATE TABLE vpc_flow_logs_curated (
+    version             INT,
+    log_account_id      VARCHAR(20),
+    interface_id        VARCHAR(30),
+    srcaddr             VARCHAR(45),
+    dstaddr             VARCHAR(45),
+    srcport             INT,
+    dstport             INT,
+    protocol            INT,
+    packets             BIGINT,
+    bytes               BIGINT,
+    start_time          BIGINT,
+    end_time            BIGINT,
+    action              VARCHAR(10),
+    log_status          VARCHAR(10),
+    vpc_id              VARCHAR(30),
+    subnet_id           VARCHAR(30),
+    instance_id         VARCHAR(30),
+    tcp_flags           INT,
+    type                VARCHAR(10),
+    pkt_srcaddr         VARCHAR(45),
+    pkt_dstaddr         VARCHAR(45),
+    log_region          VARCHAR(30),
+    az_id               VARCHAR(30),
+    sublocation_type    VARCHAR(20),
+    sublocation_id      VARCHAR(30),
+    pkt_src_aws_service VARCHAR(50),
+    pkt_dst_aws_service VARCHAR(50),
+    flow_direction      VARCHAR(10),
+    traffic_path        INT,
+    account_id          VARCHAR(20),
+    region              VARCHAR(20),
+    year                VARCHAR(4),
+    month               VARCHAR(2),
+    day                 VARCHAR(2),
+    log_date DATE GENERATED ALWAYS AS (
+        TO_DATE(year || '-' || month || '-' || day, 'YYYY-MM-DD')
+    ) STORED
+) PARTITION BY RANGE (log_date);
+
+-- 2026 monthly partitions (manual)
+CREATE TABLE vpc_logs_2026_01 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+
+CREATE TABLE vpc_logs_2026_02 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+CREATE TABLE vpc_logs_2026_03 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+
+CREATE TABLE vpc_logs_2026_04 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+
+CREATE TABLE vpc_logs_2026_05 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+
+CREATE TABLE vpc_logs_2026_06 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+
+CREATE TABLE vpc_logs_2026_07 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+CREATE TABLE vpc_logs_2026_08 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+CREATE TABLE vpc_logs_2026_09 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+
+CREATE TABLE vpc_logs_2026_10 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+
+CREATE TABLE vpc_logs_2026_11 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+
+CREATE TABLE vpc_logs_2026_12 PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
+
+-- Default partition catches anything outside defined ranges
+CREATE TABLE vpc_logs_default PARTITION OF vpc_flow_logs_curated DEFAULT;
+
+
+CREATE INDEX idx_vpc_log_date     ON vpc_flow_logs_curated (log_date);
+CREATE INDEX idx_vpc_account_id   ON vpc_flow_logs_curated (account_id);
+CREATE INDEX idx_vpc_region       ON vpc_flow_logs_curated (region);
+CREATE INDEX idx_vpc_vpc_id       ON vpc_flow_logs_curated (vpc_id);
+CREATE INDEX idx_vpc_srcaddr      ON vpc_flow_logs_curated (srcaddr);
+CREATE INDEX idx_vpc_dstaddr      ON vpc_flow_logs_curated (dstaddr);
+CREATE INDEX idx_vpc_action       ON vpc_flow_logs_curated (action);
+CREATE INDEX idx_vpc_date_action  ON vpc_flow_logs_curated (log_date, action);
+CREATE INDEX idx_vpc_vpc_date     ON vpc_flow_logs_curated (vpc_id, log_date);
+CREATE INDEX idx_vpc_acc_region   ON vpc_flow_logs_curated (account_id, region);
+
+
