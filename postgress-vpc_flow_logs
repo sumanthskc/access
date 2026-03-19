@@ -22,27 +22,25 @@ year  = args['year']
 month = args['month']
 day   = args['day']
 
-s3_path = f"s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/*/*/year={year}/month={month}/day={day}/*"
+base_path = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
+s3_path   = f"{base_path}*/*/year={year}/month={month}/day={day}/"
+
 print(f"Reading from: {s3_path}")
 
 # ── Step 1: Read Parquet ──────────────────────────────────────
 df = spark.read \
     .option("mergeSchema", "false") \
+    .option("basePath",    base_path) \
     .parquet(s3_path)
 
-print("Schema after read:")
-df.printSchema()
-
-# ── Step 2: Add partition columns + log_date ─────────────────
-df = df.withColumn("year",  F.lit(year)) \
-       .withColumn("month", F.lit(month)) \
-       .withColumn("day",   F.lit(day)) \
-       .withColumn("log_date",
-           F.to_date(
-               F.concat_ws("-", F.lit(year), F.lit(month), F.lit(day)),
-               "yyyy-MM-dd"
-           )
-       )
+# ── Step 2: Add log_date ──────────────────────────────────────
+df = df.withColumn(
+    "log_date",
+    F.to_date(
+        F.concat_ws("-", F.col("year"), F.col("month"), F.col("day")),
+        "yyyy-MM-dd"
+    )
+)
 
 # ── Step 3: Drop Bad Rows ─────────────────────────────────────
 df = df.dropna(subset=["srcaddr", "dstaddr", "log_date", "account_id"])
