@@ -1,217 +1,12 @@
-Here's the complete checklist — in order:
-
----
-
-## 1. PostgreSQL — Verify Table + Partitions
-
-```sql
--- Check parent table exists
-\d vpc_flow_logs_curated
-
--- Check partitions created
-SELECT tablename 
-FROM pg_tables 
-WHERE tablename LIKE 'vpc_logs%' 
-ORDER BY tablename;
-
--- Check default partition exists
-SELECT tablename 
-FROM pg_tables 
-WHERE tablename = 'vpc_logs_default';
-```
-
----
-
-## 2. PostgreSQL — Create Glue User
-
-```sql
-CREATE USER glue_user WITH PASSWORD 'StrongPassword123';
-GRANT CONNECT ON DATABASE networklogs TO glue_user;
-GRANT USAGE ON SCHEMA public TO glue_user;
-GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA public TO glue_user;
-```
-
----
-
-## 3. EC2 — Allow External Connections
-
-### pg_hba.conf
-```bash
-sudo nano /etc/postgresql/14/main/pg_hba.conf
-```
-Add:
-```
-host    networklogs    glue_user    10.0.0.0/16    md5
-```
-Reload:
-```bash
-sudo systemctl reload postgresql
-```
-
-### postgresql.conf
-```bash
-sudo nano /etc/postgresql/14/main/postgresql.conf
-```
-Ensure:
-```ini
-listen_addresses = '*'
-```
-Restart:
-```bash
-sudo systemctl restart postgresql
-```
-
----
-
-## 4. EC2 Security Group
-
-In **EC2 Console → Security Groups → your EC2 SG → Inbound Rules → Add Rule:**
-
-| Field | Value |
-|---|---|
-| Type | Custom TCP |
-| Port | 5432 |
-| Source | Your VPC CIDR (e.g. `10.0.0.0/16`) |
-
----
-
-## 5. Verify S3 Curated Path Exists
-
-```bash
-aws s3 ls s3://your-bucket/curated/account_id=111111111111/region=us-east-1/year=2026/month=02/day=15/
-```
-
-Should list `.parquet` files — if empty, your curated Glue job hasn't run yet for that partition.
-
----
-
-## 6. Create Glue Connection
-
-**Glue Console → Data Connections → Create Connection:**
-
-| Field | Value |
-|---|---|
-| Name | `postgres-ec2-connection` |
-| Type | `JDBC` |
-| JDBC URL | `jdbc:postgresql://<EC2-private-IP>:5432/networklogs` |
-| Username | `glue_user` |
-| Password | `StrongPassword123` |
-| VPC | Your VPC |
-| Subnet | Same subnet as EC2 |
-| Security Group | EC2's SG |
-
-After creating → **Test Connection** — must show ✅ success.
-
----
-
-## 7. IAM Role — Attach Policies
-
-Go to **IAM → Roles → your Glue role → Add Permissions:**
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::your-bucket",
-        "arn:aws:s3:::your-bucket/curated/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["glue:GetConnection"],
-      "Resource": "arn:aws:glue:us-east-1:your-account-id:connection/postgres-ec2-connection"
-    }
-  ]
-}
-```
-
-Also ensure these managed policies are attached:
-- ✅ `AWSGlueServiceRole`
-- ✅ `AmazonS3ReadOnlyAccess`
-
----
-
-## 8. Test PostgreSQL Connectivity from EC2
-
-```bash
-psql -h localhost -U glue_user -d networklogs -c "SELECT 1;"
-```
-
-Should return:
-```
- ?column?
-----------
-        1
-(1 row)
-```
-
----
-
-## Complete Checklist
-
-```
-✅ 1. Table + partitions created in PostgreSQL
-✅ 2. glue_user created with correct grants
-✅ 3. pg_hba.conf updated + listen_addresses = '*'
-✅ 4. EC2 SG port 5432 open to VPC CIDR
-✅ 5. S3 curated path confirmed with parquet files
-✅ 6. Glue connection created + test passed
-✅ 7. IAM role has S3 read + glue:GetConnection
-✅ 8. psql connectivity test passes
-```
-
----
-
-**Next step:** Go through each item top to bottom — once all 8 are ✅, you're ready to write the Glue ETL job with zero surprises.
-
-
-
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "glue:GetConnection",
-        "glue:GetConnections"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups",
-        "ec2:DescribeVpcs",
-        "ec2:DescribeAvailabilityZones",
-        "ec2:CreateNetworkInterface",
-        "ec2:DeleteNetworkInterface",
-        "ec2:DescribeNetworkInterfaces"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-
-
 import sys
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
 from pyspark.sql import functions as F
 
-# ── Args ──────────────────────────────────────────────────────
-args = getResolvedOptions(sys.argv, [
-    'JOB_NAME',
-    'year',
-    'month',
-    'day'
-])
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'year', 'month', 'day'])
 
 sc          = SparkContext()
 glueContext = GlueContext(sc)
@@ -219,18 +14,15 @@ spark       = glueContext.spark_session
 job         = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# ── Spark Configs ─────────────────────────────────────────────
 spark.conf.set("spark.sql.shuffle.partitions",     "10")
 spark.conf.set("spark.sql.parquet.mergeSchema",    "false")
 spark.conf.set("spark.sql.parquet.filterPushdown", "true")
 
-# ── Parameters ────────────────────────────────────────────────
 year  = args['year']
 month = args['month']
 day   = args['day']
 
-# ── S3 Path ───────────────────────────────────────────────────
-s3_path = f"s3://your-bucket/curated/year={year}/month={month}/day={day}/"
+s3_path = f"s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/*/*/year={year}/month={month}/day={day}/*"
 print(f"Reading from: {s3_path}")
 
 # ── Step 1: Read Parquet ──────────────────────────────────────
@@ -238,19 +30,24 @@ df = spark.read \
     .option("mergeSchema", "false") \
     .parquet(s3_path)
 
-# ── Step 2: Add log_date ──────────────────────────────────────
-df = df.withColumn(
-    "log_date",
-    F.to_date(
-        F.concat_ws("-", F.col("year"), F.col("month"), F.col("day")),
-        "yyyy-MM-dd"
-    )
-)
+print("Schema after read:")
+df.printSchema()
+
+# ── Step 2: Add partition columns + log_date ─────────────────
+df = df.withColumn("year",  F.lit(year)) \
+       .withColumn("month", F.lit(month)) \
+       .withColumn("day",   F.lit(day)) \
+       .withColumn("log_date",
+           F.to_date(
+               F.concat_ws("-", F.lit(year), F.lit(month), F.lit(day)),
+               "yyyy-MM-dd"
+           )
+       )
 
 # ── Step 3: Drop Bad Rows ─────────────────────────────────────
 df = df.dropna(subset=["srcaddr", "dstaddr", "log_date", "account_id"])
 
-# ── Step 4: Select PostgreSQL Columns ────────────────────────
+# ── Step 4: Select PostgreSQL Columns ─────────────────────────
 df = df.select(
     "version", "log_account_id", "interface_id",
     "srcaddr", "dstaddr", "srcport", "dstport",
@@ -265,98 +62,19 @@ df = df.select(
     "log_date"
 )
 
-# ── Step 5: Write to PostgreSQL ───────────────────────────────
-df.coalesce(10).write \
-    .mode("append") \
-    .option("driver",        "org.postgresql.Driver") \
-    .option("user",          "glue_user") \
-    .option("password",      "StrongPassword123") \
-    .option("batchsize",     "500000") \
-    .option("numPartitions", "10") \
-    .option("stringtype",    "unspecified") \
-    .jdbc(
-        url="jdbc:postgresql://10.88.32.172:5432/networklogs?sslmode=disable",
-        table="public.vpc_flow_logs_curated"
-    )
+# ── Step 5: Convert to DynamicFrame ──────────────────────────
+dyf_final = DynamicFrame.fromDF(df.coalesce(10), glueContext, "dyf_final")
+
+# ── Step 6: Write via Glue Connection ────────────────────────
+glueContext.write_dynamic_frame.from_jdbc_conf(
+    frame=dyf_final,
+    catalog_connection="postgres-ec2-connection",
+    connection_options={
+        "dbtable":  "public.vpc_flow_logs_curated_etl",
+        "database": "networklogs"
+    },
+    transformation_ctx="write_postgres"
+)
 
 print(f"✅ Done: {year}-{month}-{day}")
 job.commit()
-
-
-KeyValue--year2026--month02--day15
-
-
-CREATE TABLE vpc_flow_logs_curated (
-    version             INT,
-    log_account_id      VARCHAR(20),
-    interface_id        VARCHAR(30),
-    srcaddr             VARCHAR(45),
-    dstaddr             VARCHAR(45),
-    srcport             INT,
-    dstport             INT,
-    protocol            INT,
-    packets             BIGINT,
-    bytes               BIGINT,
-    start_time          BIGINT,
-    end_time            BIGINT,
-    action              VARCHAR(10),
-    log_status          VARCHAR(10),
-    vpc_id              VARCHAR(30),
-    subnet_id           VARCHAR(30),
-    instance_id         VARCHAR(30),
-    tcp_flags           INT,
-    type                VARCHAR(10),
-    pkt_srcaddr         VARCHAR(45),
-    pkt_dstaddr         VARCHAR(45),
-    log_region          VARCHAR(30),
-    az_id               VARCHAR(30),
-    sublocation_type    VARCHAR(20),
-    sublocation_id      VARCHAR(30),
-    pkt_src_aws_service VARCHAR(50),
-    pkt_dst_aws_service VARCHAR(50),
-    flow_direction      VARCHAR(10),
-    traffic_path        INT,
-    account_id          VARCHAR(20),
-    region              VARCHAR(20),
-    year                VARCHAR(4),
-    month               VARCHAR(2),
-    day                 VARCHAR(2),
-    log_date            DATE        -- ← plain column, Glue writes this
-) PARTITION BY RANGE (log_date);
--- Auto-create all 12 partitions for 2026
-DO $$
-DECLARE
-    m INT;
-    start_date DATE;
-    end_date DATE;
-    partition_name TEXT;
-BEGIN
-    FOR m IN 1..12 LOOP
-        start_date     := DATE_TRUNC('month', TO_DATE('2026-' || LPAD(m::TEXT, 2, '0') || '-01', 'YYYY-MM-DD'));
-        end_date       := start_date + INTERVAL '1 month';
-        partition_name := 'vpc_logs_2026_' || LPAD(m::TEXT, 2, '0');
-        EXECUTE format(
-            'CREATE TABLE %I PARTITION OF vpc_flow_logs_curated
-             FOR VALUES FROM (%L) TO (%L)',
-            partition_name, start_date, end_date
-        );
-        RAISE NOTICE 'Created partition: %', partition_name;
-    END LOOP;
-END $$;
--- Default partition
-CREATE TABLE vpc_logs_default PARTITION OF vpc_flow_logs_curated DEFAULT;
--- Indexes
-CREATE INDEX idx_vpc_log_date    ON vpc_flow_logs_curated (log_date);
-CREATE INDEX idx_vpc_account_id  ON vpc_flow_logs_curated (account_id);
-CREATE INDEX idx_vpc_region      ON vpc_flow_logs_curated (region);
-CREATE INDEX idx_vpc_vpc_id      ON vpc_flow_logs_curated (vpc_id);
-CREATE INDEX idx_vpc_srcaddr     ON vpc_flow_logs_curated (srcaddr);
-CREATE INDEX idx_vpc_dstaddr     ON vpc_flow_logs_curated (dstaddr);
-CREATE INDEX idx_vpc_action      ON vpc_flow_logs_curated (action);
-CREATE INDEX idx_vpc_date_action ON vpc_flow_logs_curated (log_date, action);
-CREATE INDEX idx_vpc_vpc_date    ON vpc_flow_logs_curated (vpc_id, log_date);
-CREATE INDEX idx_vpc_acc_region  ON vpc_flow_logs_curated (account_id, region);
-
-CREATE TABLE vpc_logs_2026_02_15
-    PARTITION OF vpc_flow_logs_curated
-    FOR VALUES FROM ('2026-02-15') TO ('2026-02-16');
