@@ -284,3 +284,79 @@ job.commit()
 
 
 KeyValue--year2026--month02--day15
+
+
+CREATE TABLE vpc_flow_logs_curated (
+    version             INT,
+    log_account_id      VARCHAR(20),
+    interface_id        VARCHAR(30),
+    srcaddr             VARCHAR(45),
+    dstaddr             VARCHAR(45),
+    srcport             INT,
+    dstport             INT,
+    protocol            INT,
+    packets             BIGINT,
+    bytes               BIGINT,
+    start_time          BIGINT,
+    end_time            BIGINT,
+    action              VARCHAR(10),
+    log_status          VARCHAR(10),
+    vpc_id              VARCHAR(30),
+    subnet_id           VARCHAR(30),
+    instance_id         VARCHAR(30),
+    tcp_flags           INT,
+    type                VARCHAR(10),
+    pkt_srcaddr         VARCHAR(45),
+    pkt_dstaddr         VARCHAR(45),
+    log_region          VARCHAR(30),
+    az_id               VARCHAR(30),
+    sublocation_type    VARCHAR(20),
+    sublocation_id      VARCHAR(30),
+    pkt_src_aws_service VARCHAR(50),
+    pkt_dst_aws_service VARCHAR(50),
+    flow_direction      VARCHAR(10),
+    traffic_path        INT,
+    account_id          VARCHAR(20),
+    region              VARCHAR(20),
+    year                VARCHAR(4),
+    month               VARCHAR(2),
+    day                 VARCHAR(2),
+    log_date            DATE        -- ← plain column, Glue writes this
+) PARTITION BY RANGE (log_date);
+-- Auto-create all 12 partitions for 2026
+DO $$
+DECLARE
+    m INT;
+    start_date DATE;
+    end_date DATE;
+    partition_name TEXT;
+BEGIN
+    FOR m IN 1..12 LOOP
+        start_date     := DATE_TRUNC('month', TO_DATE('2026-' || LPAD(m::TEXT, 2, '0') || '-01', 'YYYY-MM-DD'));
+        end_date       := start_date + INTERVAL '1 month';
+        partition_name := 'vpc_logs_2026_' || LPAD(m::TEXT, 2, '0');
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF vpc_flow_logs_curated
+             FOR VALUES FROM (%L) TO (%L)',
+            partition_name, start_date, end_date
+        );
+        RAISE NOTICE 'Created partition: %', partition_name;
+    END LOOP;
+END $$;
+-- Default partition
+CREATE TABLE vpc_logs_default PARTITION OF vpc_flow_logs_curated DEFAULT;
+-- Indexes
+CREATE INDEX idx_vpc_log_date    ON vpc_flow_logs_curated (log_date);
+CREATE INDEX idx_vpc_account_id  ON vpc_flow_logs_curated (account_id);
+CREATE INDEX idx_vpc_region      ON vpc_flow_logs_curated (region);
+CREATE INDEX idx_vpc_vpc_id      ON vpc_flow_logs_curated (vpc_id);
+CREATE INDEX idx_vpc_srcaddr     ON vpc_flow_logs_curated (srcaddr);
+CREATE INDEX idx_vpc_dstaddr     ON vpc_flow_logs_curated (dstaddr);
+CREATE INDEX idx_vpc_action      ON vpc_flow_logs_curated (action);
+CREATE INDEX idx_vpc_date_action ON vpc_flow_logs_curated (log_date, action);
+CREATE INDEX idx_vpc_vpc_date    ON vpc_flow_logs_curated (vpc_id, log_date);
+CREATE INDEX idx_vpc_acc_region  ON vpc_flow_logs_curated (account_id, region);
+
+CREATE TABLE vpc_logs_2026_02_15
+    PARTITION OF vpc_flow_logs_curated
+    FOR VALUES FROM ('2026-02-15') TO ('2026-02-16');
