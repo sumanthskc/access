@@ -33,9 +33,7 @@ CREATE TABLE vpc_flow_logs_curated (
     year                VARCHAR(4),
     month               VARCHAR(2),
     day                 VARCHAR(2),
-    log_date DATE GENERATED ALWAYS AS (
-        (year || '-' || month || '-' || day)::DATE
-    ) STORED
+    log_date            DATE        -- ← plain column, Glue writes this
 ) PARTITION BY RANGE (log_date);
 
 -- Auto-create all 12 partitions for 2026
@@ -61,7 +59,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- Default partition (catches data outside 2026)
+-- Default partition
 CREATE TABLE vpc_logs_default PARTITION OF vpc_flow_logs_curated DEFAULT;
 
 -- Indexes
