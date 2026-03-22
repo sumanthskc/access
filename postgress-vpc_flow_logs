@@ -126,3 +126,9 @@ CREATE INDEX idx_etl_vpc_id     ON vpc_flow_logs_curated_etl (vpc_id);
 CREATE INDEX idx_etl_srcaddr    ON vpc_flow_logs_curated_etl (srcaddr);
 CREATE INDEX idx_etl_dstaddr    ON vpc_flow_logs_curated_etl (dstaddr);
 CREATE INDEX idx_etl_action     ON vpc_flow_logs_curated_etl (action);
+
+
+
+CREATE TABLE vpc_logs_2026_02_15
+    PARTITION OF vpc_flow_logs_curated_etl
+    FOR VALUES FROM ('2026-02-15') TO ('2026-02-16');
