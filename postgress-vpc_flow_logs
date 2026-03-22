@@ -320,3 +320,19 @@ glueContext.write_dynamic_frame.from_jdbc_conf(
 
 print(f"✅ Done: {year}-{month}-{day}")
 job.commit()
+
+
+-- Grant schema usage
+GRANT USAGE ON SCHEMA public TO glue_user;
+
+-- Grant insert/select on all existing tables
+GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA public TO glue_user;
+
+-- Grant for future tables too
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT INSERT, SELECT ON TABLES TO glue_user;
+
+-- Check glue_user privileges
+SELECT grantee, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee = 'glue_user';
