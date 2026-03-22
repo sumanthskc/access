@@ -336,3 +336,18 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 SELECT grantee, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'glue_user';
+
+
+
+# ── Step 2: Add log_date ──────────────────────────────────────
+df = df.withColumn(
+    "log_date",
+    F.to_date(
+        F.concat_ws("-",
+            F.lit(year),
+            F.lpad(F.lit(month), 2, "0"),   # ✅ pads 2 → 02
+            F.lpad(F.lit(day),   2, "0")    # ✅ pads 5 → 05
+        ),
+        "yyyy-MM-dd"
+    )
+)
