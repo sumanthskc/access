@@ -76,3 +76,53 @@ glueContext.write_dynamic_frame.from_jdbc_conf(
 
 print(f"✅ Done: {year}-{month}-{day}")
 job.commit()
+
+
+CREATE TABLE vpc_flow_logs_curated_etl (
+    version             INT,
+    interface_id        VARCHAR(30),
+    srcaddr             VARCHAR(45),
+    dstaddr             VARCHAR(45),
+    srcport             INT,
+    dstport             INT,
+    protocol            INT,
+    packets             BIGINT,
+    bytes               BIGINT,
+    start               BIGINT,
+    "end"               BIGINT,
+    action              VARCHAR(10),
+    log_status          VARCHAR(10),
+    vpc_id              VARCHAR(30),
+    subnet_id           VARCHAR(30),
+    instance_id         VARCHAR(30),
+    tcp_flags           INT,
+    type                VARCHAR(10),
+    pkt_srcaddr         VARCHAR(45),
+    pkt_dstaddr         VARCHAR(45),
+    az_id               VARCHAR(30),
+    sublocation_type    VARCHAR(20),
+    sublocation_id      VARCHAR(30),
+    pkt_src_aws_service VARCHAR(50),
+    pkt_dst_aws_service VARCHAR(50),
+    flow_direction      VARCHAR(10),
+    traffic_path        INT,
+    account_id          VARCHAR(20),
+    region              VARCHAR(20),
+    year                VARCHAR(4),
+    month               VARCHAR(2),
+    day                 VARCHAR(2),
+    log_date            DATE
+) PARTITION BY RANGE (log_date);
+
+-- Default partition
+CREATE TABLE vpc_flow_logs_curated_etl_default
+    PARTITION OF vpc_flow_logs_curated_etl DEFAULT;
+
+-- Indexes
+CREATE INDEX idx_etl_log_date   ON vpc_flow_logs_curated_etl (log_date);
+CREATE INDEX idx_etl_account_id ON vpc_flow_logs_curated_etl (account_id);
+CREATE INDEX idx_etl_region     ON vpc_flow_logs_curated_etl (region);
+CREATE INDEX idx_etl_vpc_id     ON vpc_flow_logs_curated_etl (vpc_id);
+CREATE INDEX idx_etl_srcaddr    ON vpc_flow_logs_curated_etl (srcaddr);
+CREATE INDEX idx_etl_dstaddr    ON vpc_flow_logs_curated_etl (dstaddr);
+CREATE INDEX idx_etl_action     ON vpc_flow_logs_curated_etl (action);
