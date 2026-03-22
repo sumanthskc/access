@@ -183,3 +183,140 @@ COLUMNS IN PARQUET:
   - bytes
   ...
 ============================================================
+
+
+
+DROP TABLE IF EXISTS vpc_flow_logs_curated_etl CASCADE;
+
+CREATE TABLE vpc_flow_logs_curated_etl (
+    az_id               VARCHAR(30),
+    action              VARCHAR(10),
+    bytes               BIGINT,
+    dstaddr             VARCHAR(45),
+    dstport             INT,
+    end_time            BIGINT,
+    flow_direction      VARCHAR(10),
+    instance_id         VARCHAR(30),
+    interface_id        VARCHAR(30),
+    log_status          VARCHAR(10),
+    packets             BIGINT,
+    pkt_dst_aws_service VARCHAR(50),
+    pkt_dstaddr         VARCHAR(45),
+    pkt_src_aws_service VARCHAR(50),
+    pkt_srcaddr         VARCHAR(45),
+    protocol            INT,
+    srcaddr             VARCHAR(45),
+    srcport             INT,
+    start_time          BIGINT,
+    sublocation_id      VARCHAR(30),
+    sublocation_type    VARCHAR(20),
+    subnet_id           VARCHAR(30),
+    tcp_flags           INT,
+    traffic_path        INT,
+    type                VARCHAR(10),
+    version             INT,
+    vpc_id              VARCHAR(30),
+    account_id          VARCHAR(20),
+    region              VARCHAR(20),
+    year                VARCHAR(4),
+    month               VARCHAR(2),
+    day                 VARCHAR(2),
+    log_date            DATE
+) PARTITION BY RANGE (log_date);
+
+-- Default partition
+CREATE TABLE vpc_flow_logs_curated_etl_default
+    PARTITION OF vpc_flow_logs_curated_etl DEFAULT;
+
+-- Feb 15 partition
+CREATE TABLE vpc_logs_2026_02_15
+    PARTITION OF vpc_flow_logs_curated_etl
+    FOR VALUES FROM ('2026-02-15') TO ('2026-02-16');
+
+-- Indexes
+CREATE INDEX idx_etl_log_date   ON vpc_flow_logs_curated_etl (log_date);
+CREATE INDEX idx_etl_account_id ON vpc_flow_logs_curated_etl (account_id);
+CREATE INDEX idx_etl_region     ON vpc_flow_logs_curated_etl (region);
+CREATE INDEX idx_etl_vpc_id     ON vpc_flow_logs_curated_etl (vpc_id);
+CREATE INDEX idx_etl_srcaddr    ON vpc_flow_logs_curated_etl (srcaddr);
+CREATE INDEX idx_etl_dstaddr    ON vpc_flow_logs_curated_etl (dstaddr);
+CREATE INDEX idx_etl_action     ON vpc_flow_logs_curated_etl (action);
+
+
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql import functions as F
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'year', 'month', 'day'])
+
+sc          = SparkContext()
+glueContext = GlueContext(sc)
+spark       = glueContext.spark_session
+job         = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+spark.conf.set("spark.sql.shuffle.partitions",     "10")
+spark.conf.set("spark.sql.parquet.mergeSchema",    "false")
+spark.conf.set("spark.sql.parquet.filterPushdown", "true")
+
+year  = args['year']
+month = args['month']
+day   = args['day']
+
+base_path = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
+s3_path   = f"{base_path}*/*/year={year}/month={month}/day={day}/"
+
+print(f"Reading from: {s3_path}")
+
+# ── Step 1: Read Parquet ──────────────────────────────────────
+df = spark.read \
+    .option("mergeSchema", "false") \
+    .option("basePath",    base_path) \
+    .parquet(s3_path)
+
+# ── Step 2: Add log_date ──────────────────────────────────────
+df = df.withColumn(
+    "log_date",
+    F.to_date(
+        F.concat_ws("-", F.col("year"), F.col("month"), F.col("day")),
+        "yyyy-MM-dd"
+    )
+)
+
+# ── Step 3: Drop Bad Rows ─────────────────────────────────────
+df = df.dropna(subset=["srcaddr", "dstaddr", "log_date", "account_id"])
+
+# ── Step 4: Select Exact Columns ─────────────────────────────
+df = df.select(
+    "az_id", "action", "bytes",
+    "dstaddr", "dstport", "end_time",
+    "flow_direction", "instance_id", "interface_id",
+    "log_status", "packets", "pkt_dst_aws_service",
+    "pkt_dstaddr", "pkt_src_aws_service", "pkt_srcaddr",
+    "protocol", "srcaddr", "srcport", "start_time",
+    "sublocation_id", "sublocation_type", "subnet_id",
+    "tcp_flags", "traffic_path", "type", "version",
+    "vpc_id", "account_id", "region",
+    "year", "month", "day", "log_date"
+)
+
+# ── Step 5: Convert to DynamicFrame ──────────────────────────
+dyf_final = DynamicFrame.fromDF(df.coalesce(10), glueContext, "dyf_final")
+
+# ── Step 6: Write via Glue Connection ────────────────────────
+glueContext.write_dynamic_frame.from_jdbc_conf(
+    frame=dyf_final,
+    catalog_connection="postgres-ec2-connection",
+    connection_options={
+        "dbtable":  "public.vpc_flow_logs_curated_etl",
+        "database": "networklogs"
+    },
+    transformation_ctx="write_postgres"
+)
+
+print(f"✅ Done: {year}-{month}-{day}")
+job.commit()
