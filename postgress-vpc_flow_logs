@@ -132,3 +132,54 @@ CREATE INDEX idx_etl_action     ON vpc_flow_logs_curated_etl (action);
 CREATE TABLE vpc_logs_2026_02_15
     PARTITION OF vpc_flow_logs_curated_etl
     FOR VALUES FROM ('2026-02-15') TO ('2026-02-16');
+
+
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'year', 'month', 'day'])
+
+sc          = SparkContext()
+glueContext = GlueContext(sc)
+spark       = glueContext.spark_session
+job         = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+year  = args['year']
+month = args['month']
+day   = args['day']
+
+base_path = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
+s3_path   = f"{base_path}*/*/year={year}/month={month}/day={day}/"
+
+df = spark.read \
+    .option("mergeSchema", "false") \
+    .option("basePath", base_path) \
+    .parquet(s3_path)
+
+# Print ALL column names clearly
+print("=" * 60)
+print("COLUMNS IN PARQUET:")
+for col in df.columns:
+    print(f"  - {col}")
+print("=" * 60)
+
+job.commit()
+```
+
+---
+
+## Step 2: Run Job and Share Output
+
+Look for this in CloudWatch logs:
+```
+============================================================
+COLUMNS IN PARQUET:
+  - az_id
+  - action
+  - bytes
+  ...
+============================================================
