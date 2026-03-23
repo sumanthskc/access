@@ -1,0 +1,98 @@
+Based on your data (6GB VPC Parquet + Route53 + 6 metadata tables + 10 aggregations), here's the optimal setup:
+
+---
+
+## Worker Configuration
+
+| Setting | Value | Why |
+|---|---|---|
+| **Glue version** | `4.0` | Latest — best Spark 3.5 performance |
+| **Worker type** | `G.2X` | 16GB RAM, 8 vCPU — needed for geo range joins |
+| **Number of workers** | `10` | 6GB data + 10 heavy aggregations |
+| **Job timeout** | `60 min` | Safety net |
+| **Max retries** | `0` | Don't retry on failure — fix and rerun |
+
+> ⚠️ **Why G.2X not G.1X?** The geo range joins (`BETWEEN network_start AND network_end`) are memory-heavy. G.1X (8GB) will OOM on the network_intelligence_final query.
+
+---
+
+## Job Parameters
+
+| Key | Value | Why |
+|---|---|---|
+| `--year` | `2026` | Partition filter |
+| `--month` | `02` | Partition filter |
+| `--day` | `15` | Partition filter |
+| `--additional-python-modules` | `psycopg2-binary` | For copy_expert |
+| `--conf spark.sql.shuffle.partitions` | `20` | Already in script |
+| `--conf spark.sql.broadcastTimeout` | `600` | Geo tables can be slow to broadcast |
+| `--conf spark.sql.autoBroadcastJoinThreshold` | `209715200` | 200MB broadcast limit |
+| `--enable-metrics` | `true` | CloudWatch metrics |
+| `--enable-spark-ui` | `true` | Spark UI for debugging |
+| `--enable-job-insights` | `true` | Glue job insights |
+| `--enable-continuous-cloudwatch-log` | `true` | Real-time logs |
+| `--TempDir` | `s3://aws-glue-assets-063114128614-us-east-1/temporary/` | Already exists |
+
+---
+
+## Glue Console Settings
+
+```
+Job Details:
+├── Name:               network_intelligence_etl
+├── IAM Role:           your-glue-role
+├── Glue version:       Glue 4.0
+├── Language:           Python 3
+├── Worker type:        G.2X
+├── Number of workers:  10
+├── Max timeout:        60
+├── Max retries:        0
+├── Connections:        postgres-ec2-connection  ← add this
+└── Script path:        s3://aws-glue-assets-.../scripts/network_intelligence_etl.py
+
+Advanced Properties:
+└── Additional python modules: psycopg2-binary
+
+Job Parameters:
+├── --year              2026
+├── --month             02
+├── --day               15
+├── --enable-metrics    true
+├── --enable-spark-ui   true
+└── --enable-continuous-cloudwatch-log  true
+```
+
+---
+
+## Expected Performance with These Settings
+
+| Step | Time |
+|---|---|
+| Spark startup + S3 reads | ~3-4 min |
+| Cache all DataFrames | ~2 min |
+| AGG 1-5 (simple aggregations) | ~5-8 min |
+| AGG 6-8 (joins + window functions) | ~5-8 min |
+| AGG 9-10 (geo range joins + DNS) | ~8-12 min |
+| Write all 10 tables to PostgreSQL | ~3-5 min |
+| **Total** | **~25-35 min** |
+
+---
+
+## IAM Role — Extra Permission Needed
+
+Make sure your Glue role has this for `psycopg2-binary` install:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:PutObject"
+  ],
+  "Resource": "arn:aws:s3:::aws-glue-assets-063114128614-us-east-1/*"
+}
+```
+
+---
+
+**Next step:** Set `Worker type = G.2X` and `Number of workers = 10` in Glue Console, add `psycopg2-binary` in additional python modules, then run the job — monitor progress via CloudWatch logs for each `[AGG N]` print statement.
