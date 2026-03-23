@@ -1,0 +1,3 @@
+“Hi Shah, good morning. Even with data stored in the S3 table bucket, the performance was slightly slower. To achieve millisecond-level performance, we loaded all aggregated queries into PostgreSQL hosted on EC2. I observed millisecond-level response times in Grafana after this setup.
+
+For analytics purposes, I’ve loaded aggregated tables for Feb 15–22 into PostgreSQL. Currently, I’m working on building an optimized and cost-effective Glue ETL script for generating and loading these aggregated queries.”
