@@ -1,0 +1,266 @@
+-- ============================================================
+-- FILE 1: Run BEFORE Glue Job
+-- Creates all tables and grants
+-- NO indexes — those go in create_indexes_post.sql
+-- ============================================================
+
+-- ============================================================
+-- TABLE 1: vpc_flow_logs_curated_etl
+-- ============================================================
+CREATE TABLE vpc_flow_logs_curated_etl (
+    az_id               VARCHAR(30),
+    action              VARCHAR(10),
+    bytes               BIGINT,
+    dstaddr             VARCHAR(45),
+    dstport             INT,
+    end_time            BIGINT,
+    flow_direction      VARCHAR(10),
+    instance_id         VARCHAR(30),
+    interface_id        VARCHAR(30),
+    log_status          VARCHAR(10),
+    packets             BIGINT,
+    pkt_dst_aws_service VARCHAR(50),
+    pkt_dstaddr         VARCHAR(45),
+    pkt_src_aws_service VARCHAR(50),
+    pkt_srcaddr         VARCHAR(45),
+    protocol            INT,
+    srcaddr             VARCHAR(45),
+    srcport             INT,
+    start_time          BIGINT,
+    sublocation_id      VARCHAR(30),
+    sublocation_type    VARCHAR(20),
+    subnet_id           VARCHAR(30),
+    tcp_flags           INT,
+    traffic_path        INT,
+    type                VARCHAR(10),
+    version             INT,
+    vpc_id              VARCHAR(30),
+    account_id          VARCHAR(20),
+    region              VARCHAR(20),
+    year                VARCHAR(4),
+    month               VARCHAR(2),
+    day                 VARCHAR(2),
+    log_date            DATE
+) PARTITION BY RANGE (log_date);
+
+CREATE TABLE vpc_flow_logs_curated_etl_default
+    PARTITION OF vpc_flow_logs_curated_etl DEFAULT;
+
+-- ============================================================
+-- TABLE 2: total_internet_egress
+-- ============================================================
+CREATE TABLE total_internet_egress (
+    account_name VARCHAR(100),
+    account_id   VARCHAR(20),
+    region       VARCHAR(30),
+    vpc_id       VARCHAR(30),
+    total_gb     NUMERIC(20, 6),
+    year         VARCHAR(4),
+    month        VARCHAR(2),
+    day          VARCHAR(2),
+    log_date     DATE
+);
+
+-- ============================================================
+-- TABLE 3: internet_bound_flows
+-- ============================================================
+CREATE TABLE internet_bound_flows (
+    account_name      VARCHAR(100),
+    account_id        VARCHAR(20),
+    region            VARCHAR(30),
+    vpc_id            VARCHAR(30),
+    total_connections BIGINT,
+    year              VARCHAR(4),
+    month             VARCHAR(2),
+    day               VARCHAR(2),
+    log_date          DATE
+);
+
+-- ============================================================
+-- TABLE 4: unique_destination
+-- ============================================================
+CREATE TABLE unique_destination (
+    account_name     VARCHAR(100),
+    account_id       VARCHAR(20),
+    region           VARCHAR(30),
+    vpc_id           VARCHAR(30),
+    destination_ip   VARCHAR(45),
+    total_bytes      BIGINT,
+    connection_count BIGINT,
+    year             VARCHAR(4),
+    month            VARCHAR(2),
+    day              VARCHAR(2),
+    log_date         DATE
+);
+
+-- ============================================================
+-- TABLE 5: vpc_action_agg
+-- ============================================================
+CREATE TABLE vpc_action_agg (
+    account_name   VARCHAR(100),
+    account_id     VARCHAR(20),
+    region         VARCHAR(30),
+    vpc_id         VARCHAR(30),
+    action         VARCHAR(10),
+    flow_direction VARCHAR(10),
+    total_gb       NUMERIC(20, 4),
+    total_packets  BIGINT,
+    record_count   BIGINT,
+    year           VARCHAR(4),
+    month          VARCHAR(2),
+    day            VARCHAR(2),
+    log_date       DATE
+);
+
+-- ============================================================
+-- TABLE 6: vpc_egress_trends_summary
+-- ============================================================
+CREATE TABLE vpc_egress_trends_summary (
+    account_name   VARCHAR(100),
+    account_id     VARCHAR(20),
+    region         VARCHAR(30),
+    vpc_id         VARCHAR(30),
+    time_hour      TIMESTAMP,
+    flow_direction VARCHAR(10),
+    traffic_mb     NUMERIC(20, 2),
+    year           VARCHAR(4),
+    month          VARCHAR(2),
+    day            VARCHAR(2),
+    log_date       DATE
+);
+
+-- ============================================================
+-- TABLE 7: vpc_top_talkers_enriched
+-- ============================================================
+CREATE TABLE vpc_top_talkers_enriched (
+    account_name      VARCHAR(100),
+    biz_unit          VARCHAR(100),
+    application_id    VARCHAR(100),
+    account_id        VARCHAR(20),
+    region            VARCHAR(30),
+    vpc_id            VARCHAR(30),
+    instance_id       VARCHAR(30),
+    dstaddr           VARCHAR(45),
+    flow_direction    VARCHAR(10),
+    total_data_out_gb NUMERIC(20, 4),
+    total_packets     BIGINT,
+    record_count      BIGINT,
+    year              VARCHAR(4),
+    month             VARCHAR(2),
+    day               VARCHAR(2),
+    log_date          DATE
+);
+
+-- ============================================================
+-- TABLE 8: vpc_top_ports_agg
+-- ============================================================
+CREATE TABLE vpc_top_ports_agg (
+    account_name     VARCHAR(100),
+    account_id       VARCHAR(20),
+    region           VARCHAR(30),
+    vpc_id           VARCHAR(30),
+    destination_port VARCHAR(30),
+    instance_id      VARCHAR(30),
+    dstaddr          VARCHAR(45),
+    data_out_gb      NUMERIC(20, 4),
+    year             VARCHAR(4),
+    month            VARCHAR(2),
+    day              VARCHAR(2),
+    log_date         DATE
+);
+
+-- ============================================================
+-- TABLE 9: destination_asn_service_agg
+-- ============================================================
+CREATE TABLE destination_asn_service_agg (
+    account_name  VARCHAR(100),
+    account_id    VARCHAR(20),
+    region        VARCHAR(30),
+    vpc_id        VARCHAR(30),
+    asn_org       VARCHAR(255),
+    service_label VARCHAR(50),
+    total_bytes   BIGINT,
+    total_gb      NUMERIC(20, 6),
+    flow_count    BIGINT,
+    year          VARCHAR(4),
+    month         VARCHAR(2),
+    day           VARCHAR(2),
+    log_date      DATE
+);
+
+-- ============================================================
+-- TABLE 10: top_domain_port_geo
+-- ============================================================
+CREATE TABLE top_domain_port_geo (
+    account_name       VARCHAR(100),
+    account_id         VARCHAR(20),
+    region             VARCHAR(30),
+    vpc_id             VARCHAR(30),
+    domain             VARCHAR(255),
+    dstport            INT,
+    destination_port   VARCHAR(30),
+    destination_ip     VARCHAR(45),
+    country_name       VARCHAR(100),
+    asn_org            VARCHAR(255),
+    final_service_type VARCHAR(50),
+    total_gb           NUMERIC(20, 6),
+    total_packets      BIGINT,
+    flow_count         BIGINT,
+    year               VARCHAR(4),
+    month              VARCHAR(2),
+    day                VARCHAR(2),
+    log_date           DATE
+);
+
+-- ============================================================
+-- TABLE 11: network_intelligence_final
+-- ============================================================
+CREATE TABLE network_intelligence_final (
+    account_name        VARCHAR(100),
+    biz_unit            VARCHAR(100),
+    application_id      VARCHAR(100),
+    account_id          VARCHAR(20),
+    region              VARCHAR(30),
+    vpc_id              VARCHAR(30),
+    instance_id         VARCHAR(30),
+    client_ip           VARCHAR(45),
+    destination_ip      VARCHAR(45),
+    domain              VARCHAR(255),
+    pkt_dst_aws_service VARCHAR(50),
+    traffic_path        INT,
+    country_name        VARCHAR(100),
+    asn_org             VARCHAR(255),
+    final_service_type  VARCHAR(50),
+    aws_region          VARCHAR(30),
+    region_scope        VARCHAR(20),
+    data_out_gb         NUMERIC(20, 6),
+    total_packets       BIGINT,
+    year                VARCHAR(4),
+    month               VARCHAR(2),
+    day                 VARCHAR(2),
+    log_date            DATE
+);
+
+-- ============================================================
+-- GRANTS (needed before Glue job inserts)
+-- ============================================================
+GRANT INSERT, SELECT ON vpc_flow_logs_curated_etl             TO glue_user;
+GRANT INSERT, SELECT ON vpc_flow_logs_curated_etl_default     TO glue_user;
+GRANT INSERT, SELECT ON total_internet_egress                 TO glue_user;
+GRANT INSERT, SELECT ON internet_bound_flows                  TO glue_user;
+GRANT INSERT, SELECT ON unique_destination                    TO glue_user;
+GRANT INSERT, SELECT ON vpc_action_agg                        TO glue_user;
+GRANT INSERT, SELECT ON vpc_egress_trends_summary             TO glue_user;
+GRANT INSERT, SELECT ON vpc_top_talkers_enriched              TO glue_user;
+GRANT INSERT, SELECT ON vpc_top_ports_agg                     TO glue_user;
+GRANT INSERT, SELECT ON destination_asn_service_agg           TO glue_user;
+GRANT INSERT, SELECT ON top_domain_port_geo                   TO glue_user;
+GRANT INSERT, SELECT ON network_intelligence_final            TO glue_user;
+
+-- ============================================================
+-- VERIFY TABLES CREATED
+-- ============================================================
+SELECT tablename
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY tablename;
