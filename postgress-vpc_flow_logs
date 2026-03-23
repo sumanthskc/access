@@ -474,3 +474,64 @@ df.coalesce(10).rdd.foreachPartition(write_partition)
 
 print(f"✅ Done: {year}-{month}-{day}")
 job.commit()
+
+
+Glue doesn't have `psycopg2` by default. Two ways to fix:
+
+---
+
+## Option 1: Add psycopg2 in Glue Job Settings (Easiest)
+
+Go to **Glue Console → Job → Job Details → Advanced Properties → Python library path:**
+
+Add this in **"Additional Python modules"** field:
+```
+psycopg2-binary
+```
+
+---
+
+## Option 2: Add as Job Parameter
+
+In **Glue Console → Job → Job Details → Job Parameters:**
+
+| Key | Value |
+|---|---|
+| `--additional-python-modules` | `psycopg2-binary` |
+
+---
+
+## Verify It Works
+
+Add this at the top of your script after imports:
+
+```python
+try:
+    import psycopg2
+    print("✅ psycopg2 loaded successfully")
+except ImportError as e:
+    print(f"❌ psycopg2 import failed: {e}")
+```
+
+---
+
+## If Both Options Fail — Use pg8000 (Pure Python, No Install Needed)
+
+```python
+import pg8000
+
+# Replace psycopg2.connect with:
+conn = pg8000.connect(
+    host=pg_host,
+    port=int(pg_port),
+    database=pg_db,
+    user=pg_user,
+    password=pg_pass
+)
+```
+
+`pg8000` is already available in Glue — no installation needed.
+
+---
+
+**Next step:** Try Option 2 first — add `--additional-python-modules` = `psycopg2-binary` in job parameters and rerun. That's the quickest fix.
