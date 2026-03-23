@@ -6,6 +6,7 @@ from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 # ──────────────────────────────────────────────────────────────
 # INIT
@@ -21,15 +22,15 @@ job.init(args['JOB_NAME'], args)
 spark.conf.set("spark.sql.shuffle.partitions",         "20")
 spark.conf.set("spark.sql.parquet.mergeSchema",        "false")
 spark.conf.set("spark.sql.parquet.filterPushdown",     "true")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "209715200")  # 200MB
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "209715200")
 spark.conf.set("spark.sql.broadcastTimeout",           "600")
 
 # ── Parameters ────────────────────────────────────────────────
-year    = args['year']
-month   = args['month']
-day     = args['day']
-month_p = month.zfill(2)
-day_p   = day.zfill(2)
+year         = args['year']
+month        = args['month']
+day          = args['day']
+month_p      = month.zfill(2)
+day_p        = day.zfill(2)
 log_date_str = f"{year}-{month_p}-{day_p}"
 
 print(f"{'=' * 60}")
@@ -55,7 +56,7 @@ R53_PATH  = f"{R53_BASE}*/*/year={year}/month={month}/day={day}/"
 META_BASE = "s3://ist-network-intelligence-vpcflowlogs-curated/meta_data_tables/"
 
 # ──────────────────────────────────────────────────────────────
-# WRITE HELPER — chunked copy_expert
+# WRITE HELPER — chunked copy_expert (avoids OOM)
 # ──────────────────────────────────────────────────────────────
 def write_to_postgres(df, table_name, columns, chunk_size=50000):
     col_str = ", ".join(columns)
@@ -76,13 +77,19 @@ def write_to_postgres(df, table_name, columns, chunk_size=50000):
             count += 1
             if count >= _chunk:
                 buffer.seek(0)
-                cur.copy_expert(f"COPY public.{table_name} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '')", buffer)
+                cur.copy_expert(
+                    f"COPY public.{table_name} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '')",
+                    buffer
+                )
                 conn.commit()
                 buffer = io.StringIO()
                 count  = 0
         if count > 0:
             buffer.seek(0)
-            cur.copy_expert(f"COPY public.{table_name} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '')", buffer)
+            cur.copy_expert(
+                f"COPY public.{table_name} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '')",
+                buffer
+            )
             conn.commit()
         cur.close()
         conn.close()
@@ -91,16 +98,16 @@ def write_to_postgres(df, table_name, columns, chunk_size=50000):
     print(f"  ✅ Written to: {table_name}")
 
 # ──────────────────────────────────────────────────────────────
-# REUSABLE SQL SNIPPETS
+# REUSABLE LOG DATE EXPRESSION
 # ──────────────────────────────────────────────────────────────
-LOG_DATE_SQL = f"TO_DATE(CONCAT(year, '-', LPAD(month, 2, '0'), '-', LPAD(day, 2, '0')), 'yyyy-MM-dd')"
+LOG_DATE_EXPR = F.to_date(F.lit(log_date_str), "yyyy-MM-dd")
 
 # ──────────────────────────────────────────────────────────────
 # STEP 1: READ ALL SOURCES
 # ──────────────────────────────────────────────────────────────
-print("\n[SETUP 1/5] Reading S3 sources...")
+print("\n[SETUP 1/4] Reading S3 sources...")
 
-# Full VPC logs (needed for AGG 4 — all traffic)
+# ── Full VPC logs ─────────────────────────────────────────────
 vpc_df = spark.read \
     .option("mergeSchema", "false") \
     .option("basePath",    VPC_BASE) \
@@ -108,15 +115,17 @@ vpc_df = spark.read \
     .dropna(subset=["srcaddr", "dstaddr", "account_id"]) \
     .withColumn("log_date", F.to_date(F.lit(log_date_str), "yyyy-MM-dd")) \
     .withColumn("dst_ip_int",
-        F.conv(F.concat(
-            F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.")[0].cast("int")), 2, "0"),
-            F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.")[1].cast("int")), 2, "0"),
-            F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.")[2].cast("int")), 2, "0"),
-            F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.")[3].cast("int")), 2, "0")
-        ), 16, 10).cast("long")
+        F.conv(
+            F.concat(
+                F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.").getItem(0).cast("int")), 2, "0"),
+                F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.").getItem(1).cast("int")), 2, "0"),
+                F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.").getItem(2).cast("int")), 2, "0"),
+                F.lpad(F.hex(F.split(F.col("dstaddr"), r"\.").getItem(3).cast("int")), 2, "0")
+            ), 16, 10
+        ).cast("long")
     )
 
-# Pre-filtered egress view — reused by AGG 1,2,3,5,6,7,8,9,10
+# ── Pre-filtered egress — used by AGG 1,2,3,5,6,7,8,9,10 ─────
 vpc_egress_df = vpc_df.filter(
     (F.col("flow_direction") == "egress") &
     (~F.col("dstaddr").startswith("10.")) &
@@ -124,29 +133,36 @@ vpc_egress_df = vpc_df.filter(
     (~F.col("dstaddr").startswith("192.168."))
 )
 
-# Route53 logs
+# ── Route53 logs ──────────────────────────────────────────────
 r53_df = spark.read \
     .option("mergeSchema", "false") \
     .option("basePath",    R53_BASE) \
     .parquet(R53_PATH) \
-    .select("account_id", "region", "vpc_id", "srcaddr",
-            "srcport", "srcids", "query_name", "query_type",
-            "answers", "rcode", "transport", "version",
-            "year", "month", "day")
+    .select(
+        "account_id", "vpc_id", "srcaddr",
+        "query_name", "answers", "rcode",
+        "year", "month", "day"
+    )
 
-# Metadata tables
+# ── Metadata tables ───────────────────────────────────────────
 ec2_df     = spark.read.option("mergeSchema", "false").parquet(f"{META_BASE}ec2_details_parquet/")
 geo_blk_df = spark.read.option("mergeSchema", "false").parquet(f"{META_BASE}geo_country_blocks_range_parquet/")
 geo_loc_df = spark.read.option("mergeSchema", "false").parquet(f"{META_BASE}geo_country_locations_parquet/")
 geo_asn_df = spark.read.option("mergeSchema", "false").parquet(f"{META_BASE}geo_asn_blocks_range_parquet/")
-aws_ip_df  = spark.read.option("mergeSchema", "false").parquet(f"{META_BASE}aws_ip_ranges_int_parquet/")
+aws_ip_df  = spark.read.option("mergeSchema", "false").parquet(f"{META_BASE}aws_ip_ranges_int_parquet/") \
+    .select(
+        F.col("service").alias("aws_service"),
+        F.col("region").alias("aws_region"),
+        F.col("network_start_int").alias("aws_net_start"),
+        F.col("network_end_int").alias("aws_net_end")
+    )
 
 print("  ✅ All sources loaded")
 
 # ──────────────────────────────────────────────────────────────
-# STEP 2: CACHE
+# STEP 2: CACHE ALL SOURCES
 # ──────────────────────────────────────────────────────────────
-print("\n[SETUP 2/5] Caching datasets...")
+print("\n[SETUP 2/4] Caching datasets...")
 
 vpc_df.cache()
 vpc_egress_df.cache()
@@ -157,108 +173,147 @@ geo_loc_df.cache()
 geo_asn_df.cache()
 aws_ip_df.cache()
 
-print("  ✅ All cached")
+print("  ✅ All sources cached")
 
 # ──────────────────────────────────────────────────────────────
-# STEP 3: BUILD REUSABLE INTERMEDIATE RESULTS
+# STEP 3: BUILD REUSABLE INTERMEDIATES
 # ──────────────────────────────────────────────────────────────
-print("\n[SETUP 3/5] Building reusable intermediate results...")
+print("\n[SETUP 3/4] Building reusable intermediates...")
 
-# ── 3a: Account lookup (reused in ALL aggregations) ───────────
-acct_df = ec2_df.select("account_id", "account_name") \
+# ── 3a: Account name lookup — reused in ALL AGGs ──────────────
+acct_df = ec2_df \
+    .select("account_id", "account_name") \
     .distinct()
 acct_df.cache()
-acct_df.createOrReplaceTempView("acct_lookup")
 
-# ── 3b: Full EC2 instance lookup (reused in AGG 6, 10) ────────
-ec2_full_df = ec2_df.select(
-    "account_id", "region", "instance_id",
-    "account_name", "biz_unit", "application_id"
-).distinct()
+# ── 3b: EC2 instance lookup — reused in AGG 6, 10 ────────────
+ec2_full_df = ec2_df \
+    .select("account_id", "region", "instance_id",
+            "account_name", "biz_unit", "application_id") \
+    .distinct()
 ec2_full_df.cache()
-ec2_full_df.createOrReplaceTempView("ec2_full")
 
-# ── 3c: Account + biz_unit fallback (reused in AGG 6, 10) ─────
-acct_biz_df = ec2_df.select(
-    "account_id", "region", "account_name", "biz_unit"
-).distinct()
+# ── 3c: Account + biz fallback — reused in AGG 6, 10 ─────────
+acct_biz_df = ec2_df \
+    .select("account_id", "region", "account_name", "biz_unit") \
+    .distinct()
 acct_biz_df.cache()
-acct_biz_df.createOrReplaceTempView("acct_biz_lookup")
 
-# ── 3d: IP Metadata — geo join on DISTINCT IPs only ───────────
-# This is the key optimization:
-# Instead of joining geo tables against 50M rows
-# we join against ~10K unique destination IPs
-print("  Building IP metadata on distinct IPs...")
+# ── 3d: IP Metadata — geo join on DISTINCT IPs only ──────────
+# KEY OPTIMIZATION: join geo tables against ~10K unique IPs
+# instead of 50M rows — converts expensive BETWEEN to equi-join
+print("  Building IP metadata on distinct destination IPs...")
 
 distinct_ips_df = vpc_egress_df \
     .select("dstaddr", "dst_ip_int") \
     .distinct()
 
-ip_metadata_df = distinct_ips_df \
+# Step 1: Join geo country blocks (BETWEEN on ~10K rows — fast)
+ip_geo_df = distinct_ips_df.alias("ip") \
     .join(
-        F.broadcast(geo_blk_df),
-        (F.col("dst_ip_int") >= geo_blk_df.network_start_integer) &
-        (F.col("dst_ip_int") <= geo_blk_df.network_end_integer),
-        "left"
-    ) \
-    .join(
-        F.broadcast(geo_loc_df),
-        "geoname_id",
-        "left"
-    ) \
-    .join(
-        F.broadcast(geo_asn_df),
-        (F.col("dst_ip_int") >= geo_asn_df.network_start_integer) &
-        (F.col("dst_ip_int") <= geo_asn_df.network_end_integer),
-        "left"
-    ) \
-    .join(
-        F.broadcast(aws_ip_df),
-        (F.col("dst_ip_int") >= aws_ip_df.network_start_int) &
-        (F.col("dst_ip_int") <= aws_ip_df.network_end_int),
+        F.broadcast(geo_blk_df.alias("blk")),
+        (F.col("ip.dst_ip_int") >= F.col("blk.network_start_integer")) &
+        (F.col("ip.dst_ip_int") <= F.col("blk.network_end_integer")),
         "left"
     ) \
     .select(
-        F.col("dstaddr"),
-        F.col("country_name"),
-        F.col("autonomous_system_organization").alias("asn_org"),
-        F.coalesce(F.col("service"), F.lit("NON-AWS")).alias("final_service_type"),
-        F.col("aws_ip_ranges.region").alias("aws_region")
+        F.col("ip.dstaddr"),
+        F.col("ip.dst_ip_int"),
+        F.col("blk.geoname_id")
+    )
+
+# Step 2: Join geo locations (equi-join on geoname_id)
+ip_geo_df = ip_geo_df.alias("ig") \
+    .join(
+        F.broadcast(geo_loc_df.alias("loc")),
+        F.col("ig.geoname_id") == F.col("loc.geoname_id"),
+        "left"
+    ) \
+    .select(
+        F.col("ig.dstaddr"),
+        F.col("ig.dst_ip_int"),
+        F.col("loc.country_name")
+    )
+
+# Step 3: Join ASN blocks (BETWEEN on ~10K rows — fast)
+ip_geo_df = ip_geo_df.alias("ig") \
+    .join(
+        F.broadcast(geo_asn_df.alias("asn")),
+        (F.col("ig.dst_ip_int") >= F.col("asn.network_start_integer")) &
+        (F.col("ig.dst_ip_int") <= F.col("asn.network_end_integer")),
+        "left"
+    ) \
+    .select(
+        F.col("ig.dstaddr"),
+        F.col("ig.dst_ip_int"),
+        F.col("ig.country_name"),
+        F.col("asn.autonomous_system_organization").alias("asn_org")
+    )
+
+# Step 4: Join AWS IP ranges (BETWEEN on ~10K rows — fast)
+ip_metadata_df = ip_geo_df.alias("ig") \
+    .join(
+        F.broadcast(aws_ip_df.alias("aws")),
+        (F.col("ig.dst_ip_int") >= F.col("aws.aws_net_start")) &
+        (F.col("ig.dst_ip_int") <= F.col("aws.aws_net_end")),
+        "left"
+    ) \
+    .select(
+        F.col("ig.dstaddr"),
+        F.col("ig.country_name"),
+        F.col("ig.asn_org"),
+        F.coalesce(F.col("aws.aws_service"), F.lit("NON-AWS")).alias("final_service_type"),
+        F.col("aws.aws_region")
     ) \
     .dropDuplicates(["dstaddr"])
 
 ip_metadata_df.cache()
-ip_metadata_df.createOrReplaceTempView("ip_metadata")
-
 print("  ✅ IP metadata built")
 
-# ── 3e: Deduped DNS — computed ONCE, reused in AGG 9 + 10 ─────
+# ── 3e: Deduped DNS — computed ONCE, reused in AGG 9, 10 ─────
 print("  Building deduped DNS lookup...")
 
-deduped_dns_df = r53_df \
+# Explode answers array
+r53_exploded_df = r53_df \
     .filter(F.col("rcode") == "NOERROR") \
+    .withColumn("ans", F.explode("answers")) \
     .select(
         "account_id", "vpc_id", "srcaddr",
-        "query_name", "answers",
+        F.col("query_name").alias("domain"),
+        F.col("ans.Rdata").alias("resolved_ip"),
+        "year", "month", "day"
+    )
+
+# Count queries per domain per IP
+r53_counted_df = r53_exploded_df \
+    .groupBy(
+        "account_id", "vpc_id", "srcaddr",
+        "domain", "resolved_ip",
         "year", "month", "day"
     ) \
-    .withColumn("ans", F.explode("answers")) \
-    .withColumn("resolved_ip", F.col("ans.Rdata")) \
-    .withColumn("domain",      F.col("query_name")) \
-    .groupBy("account_id", "vpc_id", "srcaddr",
-             "resolved_ip", "year", "month", "day") \
-    .agg(
-        F.expr("MAX_BY(domain, count(*))").alias("primary_domain")
+    .agg(F.count("*").alias("query_count"))
+
+# Pick primary domain (most queried) per IP using window function
+dns_window = Window \
+    .partitionBy("account_id", "vpc_id", "srcaddr",
+                 "resolved_ip", "year", "month", "day") \
+    .orderBy(F.desc("query_count"))
+
+deduped_dns_df = r53_counted_df \
+    .withColumn("rn", F.row_number().over(dns_window)) \
+    .filter(F.col("rn") == 1) \
+    .select(
+        "account_id", "vpc_id", "srcaddr",
+        "resolved_ip",
+        F.col("domain").alias("primary_domain"),
+        "year", "month", "day"
     )
 
 deduped_dns_df.cache()
-deduped_dns_df.createOrReplaceTempView("deduped_dns")
-
 print("  ✅ DNS lookup built")
 
-# ── 3f: VPC Egress Aggregated Base (reused in AGG 9, 10) ──────
-# Pre-aggregate vpc_egress to reduce rows before DNS + geo joins
+# ── 3f: VPC Egress Base — pre-aggregated, reused in AGG 9, 10 ─
+# Reduces rows before expensive DNS + geo joins
 print("  Building VPC egress base aggregation...")
 
 vpc_egress_base_df = vpc_egress_df \
@@ -276,19 +331,19 @@ vpc_egress_base_df = vpc_egress_df \
     )
 
 vpc_egress_base_df.cache()
-vpc_egress_base_df.createOrReplaceTempView("vpc_egress_base")
-
 print("  ✅ VPC egress base built")
 
-# ──────────────────────────────────────────────────────────────
-# STEP 4: REGISTER ALL TEMP VIEWS
-# ──────────────────────────────────────────────────────────────
-print("\n[SETUP 4/5] Registering temp views...")
+# ── Register all temp views ───────────────────────────────────
+print("\n[SETUP 4/4] Registering temp views...")
 
 vpc_df.createOrReplaceTempView("vpc_logs")
 vpc_egress_df.createOrReplaceTempView("vpc_egress")
-r53_df.createOrReplaceTempView("r53_logs")
-ec2_df.createOrReplaceTempView("ec2_details")
+vpc_egress_base_df.createOrReplaceTempView("vpc_egress_base")
+acct_df.createOrReplaceTempView("acct_lookup")
+ec2_full_df.createOrReplaceTempView("ec2_full")
+acct_biz_df.createOrReplaceTempView("acct_biz_lookup")
+ip_metadata_df.createOrReplaceTempView("ip_metadata")
+deduped_dns_df.createOrReplaceTempView("deduped_dns")
 
 print("  ✅ All views registered")
 print(f"\n{'=' * 60}")
@@ -296,24 +351,22 @@ print(f"Starting Aggregations for {log_date_str}")
 print(f"{'=' * 60}\n")
 
 # ──────────────────────────────────────────────────────────────
-# AGG 1: Total Internet Egress
+# AGG 1: Total Internet Egress (GB per VPC per day)
 # Uses: vpc_egress, acct_lookup
 # ──────────────────────────────────────────────────────────────
 print("[AGG 1] Total Internet Egress...")
 
-agg1_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN')   AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        ROUND(SUM(v.bytes) / 1073741824.0, 6) AS total_gb,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                        AS log_date
-    FROM vpc_egress v
-    LEFT JOIN acct_lookup e ON v.account_id = e.account_id
-    GROUP BY
-        e.account_name, v.account_id, v.region,
-        v.vpc_id, v.year, v.month, v.day
-""")
+agg1_df = vpc_egress_df.alias("v") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(
+        F.round(F.sum("v.bytes") / 1073741824.0, 6).alias("total_gb")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg1_df, "total_internet_egress", [
     "account_name", "account_id", "region", "vpc_id",
@@ -321,24 +374,20 @@ write_to_postgres(agg1_df, "total_internet_egress", [
 ])
 
 # ──────────────────────────────────────────────────────────────
-# AGG 2: Internet Bound Flows
+# AGG 2: Internet Bound Flows (connection count per VPC per day)
 # Uses: vpc_egress, acct_lookup
 # ──────────────────────────────────────────────────────────────
 print("[AGG 2] Internet Bound Flows...")
 
-agg2_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN') AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        COUNT(*)                            AS total_connections,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                      AS log_date
-    FROM vpc_egress v
-    LEFT JOIN acct_lookup e ON v.account_id = e.account_id
-    GROUP BY
-        e.account_name, v.account_id, v.region,
-        v.vpc_id, v.year, v.month, v.day
-""")
+agg2_df = vpc_egress_df.alias("v") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(F.count("*").alias("total_connections")) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg2_df, "internet_bound_flows", [
     "account_name", "account_id", "region", "vpc_id",
@@ -346,26 +395,24 @@ write_to_postgres(agg2_df, "internet_bound_flows", [
 ])
 
 # ──────────────────────────────────────────────────────────────
-# AGG 3: Unique Destinations
+# AGG 3: Unique Destinations (per dst IP per VPC per day)
 # Uses: vpc_egress, acct_lookup
 # ──────────────────────────────────────────────────────────────
 print("[AGG 3] Unique Destinations...")
 
-agg3_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN') AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        v.dstaddr                           AS destination_ip,
-        SUM(v.bytes)                        AS total_bytes,
-        COUNT(*)                            AS connection_count,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                      AS log_date
-    FROM vpc_egress v
-    LEFT JOIN acct_lookup e ON v.account_id = e.account_id
-    GROUP BY
-        e.account_name, v.account_id, v.region,
-        v.vpc_id, v.dstaddr, v.year, v.month, v.day
-""")
+agg3_df = vpc_egress_df.alias("v") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.col("v.dstaddr").alias("destination_ip"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(
+        F.sum("v.bytes").alias("total_bytes"),
+        F.count("*").alias("connection_count")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg3_df, "unique_destination", [
     "account_name", "account_id", "region", "vpc_id",
@@ -379,23 +426,20 @@ write_to_postgres(agg3_df, "unique_destination", [
 # ──────────────────────────────────────────────────────────────
 print("[AGG 4] VPC Action Summary...")
 
-agg4_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN')   AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        v.action, v.flow_direction,
-        ROUND(SUM(v.bytes) / 1073741824.0, 4) AS total_gb,
-        SUM(v.packets)                        AS total_packets,
-        COUNT(*)                              AS record_count,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                        AS log_date
-    FROM vpc_logs v
-    LEFT JOIN acct_lookup e ON v.account_id = e.account_id
-    GROUP BY
-        e.account_name, v.account_id, v.region, v.vpc_id,
-        v.action, v.flow_direction,
-        v.year, v.month, v.day
-""")
+agg4_df = vpc_df.alias("v") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.col("v.action"), F.col("v.flow_direction"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(
+        F.round(F.sum("v.bytes") / 1073741824.0, 4).alias("total_gb"),
+        F.sum("v.packets").alias("total_packets"),
+        F.count("*").alias("record_count")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg4_df, "vpc_action_agg", [
     "account_name", "account_id", "region", "vpc_id",
@@ -404,27 +448,22 @@ write_to_postgres(agg4_df, "vpc_action_agg", [
 ])
 
 # ──────────────────────────────────────────────────────────────
-# AGG 5: Egress Trends (hourly)
+# AGG 5: Egress Trends (hourly traffic in MB)
 # Uses: vpc_egress, acct_lookup
 # ──────────────────────────────────────────────────────────────
 print("[AGG 5] Egress Trends Summary...")
 
-agg5_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN')             AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        DATE_TRUNC('HOUR', FROM_UNIXTIME(v.start_time)) AS time_hour,
-        v.flow_direction,
-        ROUND(SUM(v.bytes) / 1048576.0, 2)              AS traffic_mb,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                                  AS log_date
-    FROM vpc_egress v
-    LEFT JOIN acct_lookup e ON v.account_id = e.account_id
-    GROUP BY
-        e.account_name, v.account_id, v.region, v.vpc_id,
-        DATE_TRUNC('HOUR', FROM_UNIXTIME(v.start_time)),
-        v.flow_direction, v.year, v.month, v.day
-""")
+agg5_df = vpc_egress_df.alias("v") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.date_trunc("HOUR", F.from_unixtime(F.col("v.start_time"))).alias("time_hour"),
+        F.col("v.flow_direction"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(F.round(F.sum("v.bytes") / 1048576.0, 2).alias("traffic_mb")) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg5_df, "vpc_egress_trends_summary", [
     "account_name", "account_id", "region", "vpc_id",
@@ -433,50 +472,51 @@ write_to_postgres(agg5_df, "vpc_egress_trends_summary", [
 ])
 
 # ──────────────────────────────────────────────────────────────
-# AGG 6: Top Talkers
+# AGG 6: Top Talkers (enriched with EC2 + biz metadata)
 # Uses: vpc_egress, ec2_full, acct_biz_lookup
 # ──────────────────────────────────────────────────────────────
 print("[AGG 6] Top Talkers Enriched...")
 
-agg6_df = spark.sql(f"""
-    WITH base AS (
-        SELECT
-            account_id, region, vpc_id, instance_id,
-            dstaddr, flow_direction,
-            year, month, day,
-            ROUND(SUM(bytes) / 1073741824.0, 4) AS data_out_gb,
-            SUM(packets)                        AS total_packets,
-            COUNT(*)                            AS record_count
-        FROM vpc_egress
-        GROUP BY
-            account_id, region, vpc_id, instance_id,
-            dstaddr, flow_direction, year, month, day
+talkers_base_df = vpc_egress_df \
+    .groupBy(
+        "account_id", "region", "vpc_id", "instance_id",
+        "dstaddr", "flow_direction",
+        "year", "month", "day"
+    ) \
+    .agg(
+        F.round(F.sum("bytes") / 1073741824.0, 4).alias("data_out_gb"),
+        F.sum("packets").alias("total_packets"),
+        F.count("*").alias("record_count")
     )
-    SELECT
-        COALESCE(e.account_name, a.account_name, 'UNKNOWN') AS account_name,
-        COALESCE(e.biz_unit,     a.biz_unit,     'UNKNOWN') AS biz_unit,
-        COALESCE(e.application_id,               'UNKNOWN') AS application_id,
-        t.account_id, t.region, t.vpc_id, t.instance_id,
-        t.dstaddr, t.flow_direction,
-        SUM(t.data_out_gb)   AS total_data_out_gb,
-        SUM(t.total_packets) AS total_packets,
-        SUM(t.record_count)  AS record_count,
-        t.year, t.month, t.day,
-        {LOG_DATE_SQL}       AS log_date
-    FROM base t
-    LEFT JOIN ec2_full e
-        ON  t.account_id  = e.account_id
-        AND t.region      = e.region
-        AND t.instance_id = e.instance_id
-    LEFT JOIN acct_biz_lookup a ON t.account_id = a.account_id
-    GROUP BY
-        COALESCE(e.account_name, a.account_name, 'UNKNOWN'),
-        COALESCE(e.biz_unit,     a.biz_unit,     'UNKNOWN'),
-        COALESCE(e.application_id,               'UNKNOWN'),
-        t.account_id, t.region, t.vpc_id, t.instance_id,
-        t.dstaddr, t.flow_direction,
-        t.year, t.month, t.day
-""")
+
+agg6_df = talkers_base_df.alias("t") \
+    .join(
+        ec2_full_df.alias("e"),
+        (F.col("t.account_id")  == F.col("e.account_id")) &
+        (F.col("t.region")      == F.col("e.region")) &
+        (F.col("t.instance_id") == F.col("e.instance_id")),
+        "left"
+    ) \
+    .join(
+        acct_biz_df.alias("a"),
+        (F.col("t.account_id") == F.col("a.account_id")) &
+        (F.col("t.region")     == F.col("a.region")),
+        "left"
+    ) \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.col("a.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.coalesce(F.col("e.biz_unit"),     F.col("a.biz_unit"),     F.lit("UNKNOWN")).alias("biz_unit"),
+        F.coalesce(F.col("e.application_id"),                        F.lit("UNKNOWN")).alias("application_id"),
+        F.col("t.account_id"), F.col("t.region"), F.col("t.vpc_id"), F.col("t.instance_id"),
+        F.col("t.dstaddr"), F.col("t.flow_direction"),
+        F.col("t.year"), F.col("t.month"), F.col("t.day")
+    ) \
+    .agg(
+        F.sum("t.data_out_gb").alias("total_data_out_gb"),
+        F.sum("t.total_packets").alias("total_packets"),
+        F.sum("t.record_count").alias("record_count")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg6_df, "vpc_top_talkers_enriched", [
     "account_name", "biz_unit", "application_id",
@@ -487,51 +527,48 @@ write_to_postgres(agg6_df, "vpc_top_talkers_enriched", [
 ])
 
 # ──────────────────────────────────────────────────────────────
-# AGG 7: Top Ports
+# AGG 7: Top Ports (top instance+IP per port by bytes)
 # Uses: vpc_egress, acct_lookup
 # ──────────────────────────────────────────────────────────────
 print("[AGG 7] Top Ports...")
 
-agg7_df = spark.sql(f"""
-    WITH ranked AS (
-        SELECT
-            account_id, region, vpc_id,
-            dstport, instance_id, dstaddr,
-            year, month, day,
-            SUM(bytes) AS total_bytes,
-            ROW_NUMBER() OVER (
-                PARTITION BY account_id, region, vpc_id,
-                             dstport, year, month, day
-                ORDER BY SUM(bytes) DESC
-            ) AS rnk
-        FROM vpc_egress
-        GROUP BY
-            account_id, region, vpc_id,
-            dstport, instance_id, dstaddr,
-            year, month, day
+ports_base_df = vpc_egress_df \
+    .groupBy(
+        "account_id", "region", "vpc_id",
+        "dstport", "instance_id", "dstaddr",
+        "year", "month", "day"
+    ) \
+    .agg(F.sum("bytes").alias("total_bytes"))
+
+port_window = Window \
+    .partitionBy("account_id", "region", "vpc_id", "dstport", "year", "month", "day") \
+    .orderBy(F.desc("total_bytes"))
+
+ports_ranked_df = ports_base_df \
+    .withColumn("rnk", F.row_number().over(port_window)) \
+    .filter(F.col("rnk") == 1) \
+    .drop("rnk")
+
+agg7_df = ports_ranked_df.alias("r") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .select(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("r.account_id"), F.col("r.region"), F.col("r.vpc_id"),
+        F.when(F.col("r.dstport") == 443,  "443 / HTTPS")
+         .when(F.col("r.dstport") == 80,   "80 / HTTP")
+         .when(F.col("r.dstport") == 53,   "53 / DNS")
+         .when(F.col("r.dstport") == 22,   "22 / SSH")
+         .when(F.col("r.dstport") == 3306, "3306 / MySQL")
+         .when(F.col("r.dstport") == 5432, "5432 / PostgreSQL")
+         .when(F.col("r.dstport") == 6379, "6379 / Redis")
+         .when(F.col("r.dstport") == 8080, "8080 / HTTP-Alt")
+         .otherwise(F.concat(F.col("r.dstport").cast("string"), F.lit(" / Other")))
+         .alias("destination_port"),
+        F.col("r.instance_id"), F.col("r.dstaddr"),
+        F.round(F.col("r.total_bytes") / 1073741824.0, 4).alias("data_out_gb"),
+        F.col("r.year"), F.col("r.month"), F.col("r.day"),
+        LOG_DATE_EXPR.alias("log_date")
     )
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN')    AS account_name,
-        r.account_id, r.region, r.vpc_id,
-        CASE
-            WHEN r.dstport = 443  THEN '443 / HTTPS'
-            WHEN r.dstport = 80   THEN '80 / HTTP'
-            WHEN r.dstport = 53   THEN '53 / DNS'
-            WHEN r.dstport = 22   THEN '22 / SSH'
-            WHEN r.dstport = 3306 THEN '3306 / MySQL'
-            WHEN r.dstport = 5432 THEN '5432 / PostgreSQL'
-            WHEN r.dstport = 6379 THEN '6379 / Redis'
-            WHEN r.dstport = 8080 THEN '8080 / HTTP-Alt'
-            ELSE CONCAT(CAST(r.dstport AS STRING), ' / Other')
-        END                                    AS destination_port,
-        r.instance_id, r.dstaddr,
-        ROUND(r.total_bytes / 1073741824.0, 4) AS data_out_gb,
-        r.year, r.month, r.day,
-        {LOG_DATE_SQL}                         AS log_date
-    FROM ranked r
-    LEFT JOIN acct_lookup e ON r.account_id = e.account_id
-    WHERE r.rnk = 1
-""")
 
 write_to_postgres(agg7_df, "vpc_top_ports_agg", [
     "account_name", "account_id", "region", "vpc_id",
@@ -545,28 +582,22 @@ write_to_postgres(agg7_df, "vpc_top_ports_agg", [
 # ──────────────────────────────────────────────────────────────
 print("[AGG 8] Destination ASN + Service...")
 
-agg8_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name, 'UNKNOWN')   AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        COALESCE(m.asn_org, 'UNKNOWN')        AS asn_org,
-        COALESCE(m.final_service_type,
-                 'NON-AWS')                   AS service_label,
-        SUM(v.bytes)                          AS total_bytes,
-        ROUND(SUM(v.bytes) / 1073741824.0, 6) AS total_gb,
-        COUNT(*)                              AS flow_count,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                        AS log_date
-    FROM vpc_egress v
-    LEFT JOIN acct_lookup e  ON v.account_id = e.account_id
-    LEFT JOIN ip_metadata m  ON v.dstaddr    = m.dstaddr
-    GROUP BY
-        COALESCE(e.account_name, 'UNKNOWN'),
-        v.account_id, v.region, v.vpc_id,
-        m.asn_org, m.final_service_type,
-        v.year, v.month, v.day
-    ORDER BY total_bytes DESC
-""")
+agg8_df = vpc_egress_df.alias("v") \
+    .join(F.broadcast(acct_df.alias("e")), "account_id", "left") \
+    .join(ip_metadata_df.alias("m"), F.col("v.dstaddr") == F.col("m.dstaddr"), "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.coalesce(F.col("m.asn_org"), F.lit("UNKNOWN")).alias("asn_org"),
+        F.coalesce(F.col("m.final_service_type"), F.lit("NON-AWS")).alias("service_label"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(
+        F.sum("v.bytes").alias("total_bytes"),
+        F.round(F.sum("v.bytes") / 1073741824.0, 6).alias("total_gb"),
+        F.count("*").alias("flow_count")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg8_df, "destination_asn_service_agg", [
     "account_name", "account_id", "region", "vpc_id",
@@ -582,51 +613,47 @@ write_to_postgres(agg8_df, "destination_asn_service_agg", [
 # ──────────────────────────────────────────────────────────────
 print("[AGG 9] Top Domain + Port + Country...")
 
-agg9_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name,   'UNKNOWN') AS account_name,
-        v.account_id, v.region, v.vpc_id,
-        COALESCE(d.primary_domain, 'UNKNOWN') AS domain,
-        v.dstport,
-        CASE
-            WHEN v.dstport = 443  THEN '443 / HTTPS'
-            WHEN v.dstport = 80   THEN '80 / HTTP'
-            WHEN v.dstport = 53   THEN '53 / DNS'
-            WHEN v.dstport = 22   THEN '22 / SSH'
-            WHEN v.dstport = 3306 THEN '3306 / MySQL'
-            WHEN v.dstport = 5432 THEN '5432 / PostgreSQL'
-            WHEN v.dstport = 6379 THEN '6379 / Redis'
-            WHEN v.dstport = 8080 THEN '8080 / HTTP-Alt'
-            ELSE CONCAT(CAST(v.dstport AS STRING), ' / Other')
-        END                                   AS destination_port,
-        v.dstaddr                             AS destination_ip,
-        m.country_name,
-        m.asn_org,
-        m.final_service_type,
-        ROUND(SUM(v.total_bytes) / 1073741824.0, 6) AS total_gb,
-        SUM(v.total_packets)                  AS total_packets,
-        SUM(v.flow_count)                     AS flow_count,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                        AS log_date
-    FROM vpc_egress_base v
-    LEFT JOIN deduped_dns d
-        ON  v.dstaddr    = d.resolved_ip
-        AND v.srcaddr    = d.srcaddr
-        AND v.account_id = d.account_id
-        AND v.vpc_id     = d.vpc_id
-        AND v.year       = d.year
-        AND v.month      = d.month
-        AND v.day        = d.day
-    LEFT JOIN acct_lookup e ON v.account_id  = e.account_id
-    LEFT JOIN ip_metadata m ON v.dstaddr     = m.dstaddr
-    GROUP BY
-        COALESCE(e.account_name,   'UNKNOWN'),
-        v.account_id, v.region, v.vpc_id,
-        d.primary_domain, v.dstport, v.dstaddr,
-        m.country_name, m.asn_org, m.final_service_type,
-        v.year, v.month, v.day
-    ORDER BY total_gb DESC
-""")
+agg9_df = vpc_egress_base_df.alias("v") \
+    .join(
+        deduped_dns_df.alias("d"),
+        (F.col("v.dstaddr")    == F.col("d.resolved_ip")) &
+        (F.col("v.srcaddr")    == F.col("d.srcaddr")) &
+        (F.col("v.account_id") == F.col("d.account_id")) &
+        (F.col("v.vpc_id")     == F.col("d.vpc_id")) &
+        (F.col("v.year")       == F.col("d.year")) &
+        (F.col("v.month")      == F.col("d.month")) &
+        (F.col("v.day")        == F.col("d.day")),
+        "left"
+    ) \
+    .join(F.broadcast(acct_df.alias("e")), F.col("v.account_id") == F.col("e.account_id"), "left") \
+    .join(ip_metadata_df.alias("m"), F.col("v.dstaddr") == F.col("m.dstaddr"), "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"),   F.lit("UNKNOWN")).alias("account_name"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"),
+        F.coalesce(F.col("d.primary_domain"), F.lit("UNKNOWN")).alias("domain"),
+        F.col("v.dstport"),
+        F.when(F.col("v.dstport") == 443,  "443 / HTTPS")
+         .when(F.col("v.dstport") == 80,   "80 / HTTP")
+         .when(F.col("v.dstport") == 53,   "53 / DNS")
+         .when(F.col("v.dstport") == 22,   "22 / SSH")
+         .when(F.col("v.dstport") == 3306, "3306 / MySQL")
+         .when(F.col("v.dstport") == 5432, "5432 / PostgreSQL")
+         .when(F.col("v.dstport") == 6379, "6379 / Redis")
+         .when(F.col("v.dstport") == 8080, "8080 / HTTP-Alt")
+         .otherwise(F.concat(F.col("v.dstport").cast("string"), F.lit(" / Other")))
+         .alias("destination_port"),
+        F.col("v.dstaddr").alias("destination_ip"),
+        F.col("m.country_name"),
+        F.col("m.asn_org"),
+        F.col("m.final_service_type"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(
+        F.round(F.sum("v.total_bytes") / 1073741824.0, 6).alias("total_gb"),
+        F.sum("v.total_packets").alias("total_packets"),
+        F.sum("v.flow_count").alias("flow_count")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg9_df, "top_domain_port_geo", [
     "account_name", "account_id", "region", "vpc_id",
@@ -644,62 +671,62 @@ write_to_postgres(agg9_df, "top_domain_port_geo", [
 # ──────────────────────────────────────────────────────────────
 print("[AGG 10] Network Intelligence Final...")
 
-agg10_df = spark.sql(f"""
-    SELECT
-        COALESCE(e.account_name,  a.account_name, 'UNKNOWN') AS account_name,
-        COALESCE(e.biz_unit,      a.biz_unit,     'UNKNOWN') AS biz_unit,
-        COALESCE(e.application_id,                'UNKNOWN') AS application_id,
-        v.account_id, v.region, v.vpc_id, v.instance_id,
-        v.srcaddr                                            AS client_ip,
-        v.dstaddr                                            AS destination_ip,
-        COALESCE(d.primary_domain, 'UNKNOWN')                AS domain,
-        v.pkt_dst_aws_service,
-        v.traffic_path,
-        m.country_name,
-        m.asn_org,
-        COALESCE(m.final_service_type, 'NON-AWS')            AS final_service_type,
-        m.aws_region,
-        CASE
-            WHEN m.final_service_type = 'NON-AWS'
-              OR m.final_service_type IS NULL THEN 'Internet'
-            WHEN m.aws_region = v.region          THEN 'Same-Region'
-            WHEN m.aws_region IS NOT NULL
-             AND m.aws_region != v.region          THEN 'Cross-Region'
-            ELSE 'Unknown'
-        END                                                  AS region_scope,
-        ROUND(SUM(v.total_bytes) / 1073741824.0, 6)          AS data_out_gb,
-        SUM(v.total_packets)                                 AS total_packets,
-        v.year, v.month, v.day,
-        {LOG_DATE_SQL}                                       AS log_date
-    FROM vpc_egress_base v
-    LEFT JOIN deduped_dns d
-        ON  v.dstaddr    = d.resolved_ip
-        AND v.srcaddr    = d.srcaddr
-        AND v.account_id = d.account_id
-        AND v.vpc_id     = d.vpc_id
-        AND v.year       = d.year
-        AND v.month      = d.month
-        AND v.day        = d.day
-    LEFT JOIN ec2_full e
-        ON  v.account_id  = e.account_id
-        AND v.region      = e.region
-        AND v.instance_id = e.instance_id
-    LEFT JOIN acct_biz_lookup a
-        ON  v.account_id = a.account_id
-        AND v.region     = a.region
-    LEFT JOIN ip_metadata m ON v.dstaddr = m.dstaddr
-    GROUP BY
-        COALESCE(e.account_name,  a.account_name, 'UNKNOWN'),
-        COALESCE(e.biz_unit,      a.biz_unit,     'UNKNOWN'),
-        COALESCE(e.application_id,                'UNKNOWN'),
-        v.account_id, v.region, v.vpc_id, v.instance_id,
-        v.srcaddr, v.dstaddr, d.primary_domain,
-        v.pkt_dst_aws_service, v.traffic_path,
-        m.country_name, m.asn_org,
-        m.final_service_type, m.aws_region,
-        v.year, v.month, v.day
-    ORDER BY total_bytes DESC
-""")
+agg10_df = vpc_egress_base_df.alias("v") \
+    .join(
+        deduped_dns_df.alias("d"),
+        (F.col("v.dstaddr")    == F.col("d.resolved_ip")) &
+        (F.col("v.srcaddr")    == F.col("d.srcaddr")) &
+        (F.col("v.account_id") == F.col("d.account_id")) &
+        (F.col("v.vpc_id")     == F.col("d.vpc_id")) &
+        (F.col("v.year")       == F.col("d.year")) &
+        (F.col("v.month")      == F.col("d.month")) &
+        (F.col("v.day")        == F.col("d.day")),
+        "left"
+    ) \
+    .join(
+        ec2_full_df.alias("e"),
+        (F.col("v.account_id")  == F.col("e.account_id")) &
+        (F.col("v.region")      == F.col("e.region")) &
+        (F.col("v.instance_id") == F.col("e.instance_id")),
+        "left"
+    ) \
+    .join(
+        acct_biz_df.alias("a"),
+        (F.col("v.account_id") == F.col("a.account_id")) &
+        (F.col("v.region")     == F.col("a.region")),
+        "left"
+    ) \
+    .join(ip_metadata_df.alias("m"), F.col("v.dstaddr") == F.col("m.dstaddr"), "left") \
+    .groupBy(
+        F.coalesce(F.col("e.account_name"), F.col("a.account_name"), F.lit("UNKNOWN")).alias("account_name"),
+        F.coalesce(F.col("e.biz_unit"),     F.col("a.biz_unit"),     F.lit("UNKNOWN")).alias("biz_unit"),
+        F.coalesce(F.col("e.application_id"),                        F.lit("UNKNOWN")).alias("application_id"),
+        F.col("v.account_id"), F.col("v.region"), F.col("v.vpc_id"), F.col("v.instance_id"),
+        F.col("v.srcaddr").alias("client_ip"),
+        F.col("v.dstaddr").alias("destination_ip"),
+        F.coalesce(F.col("d.primary_domain"), F.lit("UNKNOWN")).alias("domain"),
+        F.col("v.pkt_dst_aws_service"),
+        F.col("v.traffic_path"),
+        F.col("m.country_name"),
+        F.col("m.asn_org"),
+        F.coalesce(F.col("m.final_service_type"), F.lit("NON-AWS")).alias("final_service_type"),
+        F.col("m.aws_region"),
+        F.when(
+            F.col("m.final_service_type").isNull() | (F.col("m.final_service_type") == "NON-AWS"),
+            "Internet"
+        ).when(
+            F.col("m.aws_region") == F.col("v.region"), "Same-Region"
+        ).when(
+            F.col("m.aws_region").isNotNull() & (F.col("m.aws_region") != F.col("v.region")),
+            "Cross-Region"
+        ).otherwise("Unknown").alias("region_scope"),
+        F.col("v.year"), F.col("v.month"), F.col("v.day")
+    ) \
+    .agg(
+        F.round(F.sum("v.total_bytes") / 1073741824.0, 6).alias("data_out_gb"),
+        F.sum("v.total_packets").alias("total_packets")
+    ) \
+    .withColumn("log_date", LOG_DATE_EXPR)
 
 write_to_postgres(agg10_df, "network_intelligence_final", [
     "account_name", "biz_unit", "application_id",
