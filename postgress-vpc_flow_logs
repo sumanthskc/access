@@ -357,3 +357,120 @@ SELECT pid, state, wait_event_type, wait_event, query_start, query
 FROM pg_stat_activity
 WHERE datname = 'networklogs'
 ORDER BY query_start;
+
+
+
+import sys
+import io
+import psycopg2
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'year', 'month', 'day'])
+
+sc          = SparkContext()
+glueContext = GlueContext(sc)
+spark       = glueContext.spark_session
+job         = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+spark.conf.set("spark.sql.shuffle.partitions",     "10")
+spark.conf.set("spark.sql.parquet.mergeSchema",    "false")
+spark.conf.set("spark.sql.parquet.filterPushdown", "true")
+
+year  = args['year']
+month = args['month']
+day   = args['day']
+
+base_path = "s3://ist-network-intelligence-vpcflowlogs-curated/vpcflowlogs/"
+s3_path   = f"{base_path}*/*/year={year}/month={month}/day={day}/"
+
+print(f"Reading from: {s3_path}")
+
+# ── Step 1: Read Parquet ──────────────────────────────────────
+df = spark.read \
+    .option("mergeSchema", "false") \
+    .option("basePath",    base_path) \
+    .parquet(s3_path)
+
+# ── Step 2: Add log_date ──────────────────────────────────────
+df = df.withColumn(
+    "log_date",
+    F.to_date(
+        F.concat_ws("-",
+            F.lit(year),
+            F.lpad(F.lit(month), 2, "0"),
+            F.lpad(F.lit(day),   2, "0")
+        ),
+        "yyyy-MM-dd"
+    )
+)
+
+# ── Step 3: Drop Bad Rows ─────────────────────────────────────
+df = df.dropna(subset=["srcaddr", "dstaddr", "log_date", "account_id"])
+
+# ── Step 4: Select Exact Columns ─────────────────────────────
+df = df.select(
+    "az_id", "action", "bytes",
+    "dstaddr", "dstport", "end_time",
+    "flow_direction", "instance_id", "interface_id",
+    "log_status", "packets", "pkt_dst_aws_service",
+    "pkt_dstaddr", "pkt_src_aws_service", "pkt_srcaddr",
+    "protocol", "srcaddr", "srcport", "start_time",
+    "sublocation_id", "sublocation_type", "subnet_id",
+    "tcp_flags", "traffic_path", "type", "version",
+    "vpc_id", "account_id", "region",
+    "year", "month", "day", "log_date"
+)
+
+# ── Step 5: Write using copy_expert per partition ─────────────
+pg_host = "10.88.32.172"
+pg_port = "5432"
+pg_db   = "networklogs"
+pg_user = "glue_user"
+pg_pass = "user"
+
+COLUMNS = ",".join([
+    "az_id", "action", "bytes",
+    "dstaddr", "dstport", "end_time",
+    "flow_direction", "instance_id", "interface_id",
+    "log_status", "packets", "pkt_dst_aws_service",
+    "pkt_dstaddr", "pkt_src_aws_service", "pkt_srcaddr",
+    "protocol", "srcaddr", "srcport", "start_time",
+    "sublocation_id", "sublocation_type", "subnet_id",
+    "tcp_flags", "traffic_path", "type", "version",
+    "vpc_id", "account_id", "region",
+    "year", "month", "day", "log_date"
+])
+
+def write_partition(partition):
+    conn = psycopg2.connect(
+        host=pg_host, port=pg_port,
+        dbname=pg_db, user=pg_user, password=pg_pass
+    )
+    cur = conn.cursor()
+
+    buffer = io.StringIO()
+    for row in partition:
+        buffer.write("\t".join([
+            "" if v is None else str(v)
+            for v in row
+        ]) + "\n")
+    buffer.seek(0)
+
+    cur.copy_expert(
+        f"COPY public.vpc_flow_logs_curated_etl ({COLUMNS}) FROM STDIN WITH (FORMAT TEXT, NULL '')",
+        buffer
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# ── Step 6: Execute copy_expert across partitions ─────────────
+df.coalesce(10).rdd.foreachPartition(write_partition)
+
+print(f"✅ Done: {year}-{month}-{day}")
+job.commit()
