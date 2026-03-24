@@ -1,3 +1,8 @@
-“Hi Shah, good morning. Even with data stored in the S3 table bucket, the performance was slightly slower. To achieve millisecond-level performance, we loaded all aggregated queries into PostgreSQL hosted on EC2. I observed millisecond-level response times in Grafana after this setup.
+Option 1: Standard & Concise (Recommended)
+Best if your team consists of a mix of engineers and project managers who just need the bottom line.
 
-For analytics purposes, I’ve loaded aggregated tables for Feb 15–22 into PostgreSQL. Currently, I’m working on building an optimized and cost-effective Glue ETL script for generating and loading these aggregated queries.”
+Yesterday: I dug into the bug in our network intelligence ETL where a lot of the domain names were showing up as NULL.
+
+The Findings: I found an architectural mismatch in our join logic. Route 53 logs the EC2 instance's private IP, but the VPC Flow Logs capture the NAT Gateway's IP for outbound internet traffic. Because those source IPs didn't match, the join was failing and dropping the domains.
+
+The Fix/Today: I updated the PySpark script to drop the source IP from the join entirely. We now map DNS resolution at the VPC level using just the destination IP, Account ID, and VPC ID. The pipeline is running smoothly now, and the missing domains are successfully populating.
