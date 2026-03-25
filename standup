@@ -1,8 +1,71 @@
-Option 1: Standard & Concise (Recommended)
-Best if your team consists of a mix of engineers and project managers who just need the bottom line.
+# ── Update the distinct base to include the service column ──
+distinct_ips_df = vpc_egress_df \
+    .select("dstaddr", "dst_ip_int", "pkt_dst_aws_service") \
+    .distinct()
 
-Yesterday: I dug into the bug in our network intelligence ETL where a lot of the domain names were showing up as NULL.
+# Step 1: Join geo country blocks
+ip_geo_df = distinct_ips_df.alias("ip") \
+    .join(
+        F.broadcast(geo_blk_df.alias("blk")),
+        (F.col("ip.dst_ip_int") >= F.col("blk.network_start_integer")) &
+        (F.col("ip.dst_ip_int") <= F.col("blk.network_end_integer")),
+        "left"
+    ) \
+    .select(
+        F.col("ip.dstaddr"),
+        F.col("ip.dst_ip_int"),
+        F.col("ip.pkt_dst_aws_service"), # <-- Pass it through
+        F.col("blk.geoname_id")
+    )
 
-The Findings: I found an architectural mismatch in our join logic. Route 53 logs the EC2 instance's private IP, but the VPC Flow Logs capture the NAT Gateway's IP for outbound internet traffic. Because those source IPs didn't match, the join was failing and dropping the domains.
+# Step 2: Join geo locations
+ip_geo_df = ip_geo_df.alias("ig") \
+    .join(
+        F.broadcast(geo_loc_df.alias("loc")),
+        F.col("ig.geoname_id") == F.col("loc.geoname_id"),
+        "left"
+    ) \
+    .select(
+        F.col("ig.dstaddr"),
+        F.col("ig.dst_ip_int"),
+        F.col("ig.pkt_dst_aws_service"), # <-- Pass it through
+        F.col("loc.country_name")
+    )
 
-The Fix/Today: I updated the PySpark script to drop the source IP from the join entirely. We now map DNS resolution at the VPC level using just the destination IP, Account ID, and VPC ID. The pipeline is running smoothly now, and the missing domains are successfully populating.
+# Step 3: Join ASN blocks
+ip_geo_df = ip_geo_df.alias("ig") \
+    .join(
+        F.broadcast(geo_asn_df.alias("asn")),
+        (F.col("ig.dst_ip_int") >= F.col("asn.network_start_integer")) &
+        (F.col("ig.dst_ip_int") <= F.col("asn.network_end_integer")),
+        "left"
+    ) \
+    .select(
+        F.col("ig.dstaddr"),
+        F.col("ig.dst_ip_int"),
+        F.col("ig.pkt_dst_aws_service"), # <-- Pass it through
+        F.col("ig.country_name"),
+        F.col("asn.autonomous_system_organization").alias("asn_org")
+    )
+
+# Step 4: Join AWS IP ranges (The Crucial Fix)
+ip_metadata_df = ip_geo_df.alias("ig") \
+    .join(
+        F.broadcast(aws_ip_df.alias("aws")),
+        (F.col("ig.dst_ip_int") >= F.col("aws.aws_net_start")) &
+        (F.col("ig.dst_ip_int") <= F.col("aws.aws_net_end")) &
+        (F.col("ig.pkt_dst_aws_service") == F.col("aws.aws_service")), # <-- Added service match
+        "left"
+    ) \
+    .select(
+        F.col("ig.dstaddr"),
+        F.col("ig.pkt_dst_aws_service"), # <-- Keep this for downstream joins
+        F.col("ig.country_name"),
+        F.col("ig.asn_org"),
+        F.coalesce(F.col("aws.aws_service"), F.lit("NON-AWS")).alias("final_service_type"),
+        F.col("aws.aws_region")
+    ) \
+    .dropDuplicates(["dstaddr", "pkt_dst_aws_service"]) # <-- Deduplicate on BOTH columns
+
+ip_metadata_df.cache()
+print("  ✅ IP metadata built")
